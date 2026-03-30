@@ -9,19 +9,19 @@
 
 ## Table of Contents
 
-- [Executive Summary](#executive-summary)
-- [Business Problem](#business-problem)
-- [Business Objectives](#business-objectives)
-- [Business Value](#business-value)
-- [Key Stakeholders](#key-stakeholders)
-- [High-Level Architecture](#high-level-architecture)
-- [Pipeline Components](#pipeline-components)
-- [Technology Stack](#technology-stack)
-- [Advanced Flink Features](#advanced-flink-features)
-- [Scalability & Latency Targets](#scalability--latency-targets)
-- [Dashboard Design](#dashboard-design)
-- [Data Sources](#data-sources)
-- [Acceptance Criteria](#acceptance-criteria)
+- [Executive Summary]
+- [Business Problem]
+- [Business Objectives]
+- [Business Value]
+- [Key Stakeholders]
+- [High-Level Architecture]
+- [Pipeline Components]
+- [Technology Stack]
+- [Advanced Flink Features]
+- [Scalability & Latency Targets]
+- [Dashboard Design]
+- [Data Sources]
+- [Acceptance Criteria]
 
 ---
 
