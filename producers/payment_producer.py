@@ -4,11 +4,16 @@ Payment Producer
 Simulates a bank's payment processing system by generating fake
 RTGS, CHAPS, and Internal payment events using the Faker library.
 
-Publishes to 4 Kafka topics:
+Publishes to 3 rail-specific Kafka topics only:
   - payments.rtgs      → only RTGS events
   - payments.chaps     → only CHAPS events
   - payments.internal  → only Internal transfers
-  - payments.all       → ALL events (LiquidityPositionEngine reads this one)
+
+payments.all is NOT written here. It is produced by the PaymentStreamMerger
+Flink job (flink_jobs/payment_stream_merger.py), which reads all three rail
+topics and unions them into payments.all. This mirrors real banking architecture
+where each payment system owns its own topic and a separate merge layer
+produces the unified stream.
 
 Rate control (transactions per second per rail):
   RTGS_TPS=5      → 5 RTGS payments per second
@@ -72,7 +77,7 @@ ACCOUNTS = {
 }
 
 # ── Rail → Kafka topic mapping ─────────────────────────────────────
-# Each rail has its own dedicated Kafka topic AND publishes to payments.all
+# Each rail writes only to its own topic. The merger Flink job handles payments.all.
 RAILS = {
     "RTGS":     {"topic": "payments.rtgs",     "tps": RTGS_TPS},      # Bank of England RTGS system
     "CHAPS":    {"topic": "payments.chaps",    "tps": CHAPS_TPS},     # UK same-day sterling
@@ -156,9 +161,11 @@ def run_rail_producer(producer: Producer, rail: str, config: dict):
     Infinite loop that generates and publishes one payment per iteration.
     Each iteration:
       1. Build a random payment for this rail
-      2. Publish to the rail's dedicated topic (e.g. payments.rtgs)
-      3. Also publish to payments.all (fan-out — LiquidityPositionEngine reads this)
-      4. Sleep to hit the target TPS
+      2. Publish ONLY to the rail's dedicated topic (e.g. payments.rtgs)
+      3. Sleep to hit the target TPS
+
+    payments.all is produced by PaymentStreamMerger (flink_jobs/payment_stream_merger.py),
+    not here. Each rail producer is independent and unaware of the others.
 
     This function runs in its own thread (one thread per rail).
     """
@@ -176,12 +183,8 @@ def run_rail_producer(producer: Producer, rail: str, config: dict):
         payment  = build_payment(rail, currency)       # generate the payment dict
         payload  = json.dumps(payment)                 # serialise dict → JSON string
 
-        # Publish to the rail-specific topic (e.g. payments.rtgs)
+        # Publish only to this rail's own topic — merger job handles payments.all
         producer.produce(topic, value=payload, callback=delivery_report)
-
-        # Fan-out: also publish to payments.all so LiquidityPositionEngine sees it
-        # LiquidityPositionEngine only reads payments.all — not the individual rail topics
-        producer.produce("payments.all", value=payload, callback=delivery_report)
 
         producer.poll(0)   # non-blocking poll: fires any pending delivery_report callbacks
 
