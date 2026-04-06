@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────
+#  Prometheus Configuration
+#  Intraday Liquidity Monitoring Pipeline
+#
+#  Scrape targets:
+#    - Flink JobManager  :9249
+#    - Flink TaskManager :9249 (host port 9250)
+# ─────────────────────────────────────────────────────────────────
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+  scrape_timeout: 8s
+
+  external_labels:
+    pipeline: intraday-liquidity
+    environment: dev
+
+# ── Scrape Configs ────────────────────────────────────────────────
+scrape_configs:
+  - job_name: flink-jobmanager
+    static_configs:
+      - targets: ["flink-jobmanager:9249"]
+        labels:
+          component: jobmanager
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: flink-taskmanager
+    static_configs:
+      - targets: ["flink-taskmanager:9249"]
+        labels:
+          component: taskmanager
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # Self-monitor Prometheus
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

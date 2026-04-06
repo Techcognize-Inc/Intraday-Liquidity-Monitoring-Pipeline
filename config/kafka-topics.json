@@ -1,0 +1,201 @@
+{
+  "_comment": "Kafka topic definitions for the Intraday Liquidity Monitoring Pipeline. Used by create_topics.sh and for documentation / CI validation.",
+  "topics": [
+    {
+      "name": "payments.rtgs",
+      "description": "Real-Time Gross Settlement payment events. Large-value, time-critical GBP transfers between banks via the Bank of England RTGS system.",
+      "partitions": 16,
+      "replication_factor": 1,
+      "retention_ms": 86400000,
+      "cleanup_policy": "delete",
+      "producer": "payment_producer.py (RTGS thread)",
+      "consumers": [
+        "LiquidityPositionEngine (via payments.all fan-out)"
+      ],
+      "message_schema": {
+        "payment_id": "string (uuid4)",
+        "currency": "string (GBP | USD | EUR)",
+        "settlement_account": "string (e.g. RTGS-GBP-001)",
+        "amount": "number (decimal, 2dp)",
+        "direction": "string (DEBIT | CREDIT)",
+        "rail": "string = RTGS",
+        "counterparty": "string (bank name)",
+        "event_time": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "payments.chaps",
+      "description": "CHAPS (Clearing House Automated Payment System) payment events. Same-day sterling transfers, typically £1M–£100M.",
+      "partitions": 16,
+      "replication_factor": 1,
+      "retention_ms": 86400000,
+      "cleanup_policy": "delete",
+      "producer": "payment_producer.py (CHAPS thread)",
+      "consumers": [
+        "LiquidityPositionEngine (via payments.all fan-out)"
+      ],
+      "message_schema": {
+        "payment_id": "string (uuid4)",
+        "currency": "string (GBP | USD | EUR)",
+        "settlement_account": "string (e.g. CHAPS-GBP-001)",
+        "amount": "number (decimal, 2dp)",
+        "direction": "string (DEBIT | CREDIT)",
+        "rail": "string = CHAPS",
+        "counterparty": "string (bank name)",
+        "event_time": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "payments.internal",
+      "description": "Internal fund transfers between the bank's own settlement accounts. Lower value, higher frequency.",
+      "partitions": 16,
+      "replication_factor": 1,
+      "retention_ms": 86400000,
+      "cleanup_policy": "delete",
+      "producer": "payment_producer.py (INTERNAL thread)",
+      "consumers": [
+        "LiquidityPositionEngine (via payments.all fan-out)"
+      ],
+      "message_schema": {
+        "payment_id": "string (uuid4)",
+        "currency": "string (GBP | USD | EUR)",
+        "settlement_account": "string (e.g. INTERNAL-GBP-001)",
+        "amount": "number (decimal, 2dp)",
+        "direction": "string (DEBIT | CREDIT)",
+        "rail": "string = INTERNAL",
+        "counterparty": "string (internal account ref)",
+        "event_time": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "payments.all",
+      "description": "Fan-out of all payment rails (RTGS + CHAPS + INTERNAL). LiquidityPositionEngine consumes exclusively from this topic. Producer writes every payment here in addition to its rail-specific topic.",
+      "partitions": 16,
+      "replication_factor": 1,
+      "retention_ms": 86400000,
+      "cleanup_policy": "delete",
+      "producer": "payment_producer.py (all threads, fan-out)",
+      "consumers": [
+        "LiquidityPositionEngine (parallelism=16)"
+      ],
+      "notes": "Partition count matches LiquidityPositionEngine parallelism so each task reads exactly one partition."
+    },
+    {
+      "name": "liquidity.warnings",
+      "description": "WARNING threshold breach alerts. Fired when available_balance < warning_threshold. Latency target: within 5 seconds of the triggering payment.",
+      "partitions": 4,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "cleanup_policy": "delete",
+      "producer": "LiquidityPositionEngine (KeyedProcessFunction)",
+      "consumers": [
+        "Grafana alert rules (optional)",
+        "ops team dashboards"
+      ],
+      "message_schema": {
+        "alert_type": "string = WARNING",
+        "currency": "string",
+        "settlement_account": "string",
+        "available_balance": "number",
+        "threshold_value": "number",
+        "breach_amount": "number (threshold - balance)",
+        "payment_id": "string",
+        "triggered_at": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "liquidity.critical",
+      "description": "CRITICAL threshold breach alerts. Fired when available_balance < critical_threshold. Requires immediate treasury desk action.",
+      "partitions": 4,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "cleanup_policy": "delete",
+      "producer": "LiquidityPositionEngine (KeyedProcessFunction)",
+      "consumers": [
+        "Grafana alert rules (optional)",
+        "ops team dashboards",
+        "PagerDuty (production)"
+      ],
+      "message_schema": {
+        "alert_type": "string = CRITICAL",
+        "currency": "string",
+        "settlement_account": "string",
+        "available_balance": "number",
+        "threshold_value": "number",
+        "breach_amount": "number",
+        "payment_id": "string",
+        "triggered_at": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "liquidity.thresholds",
+      "description": "Threshold update commands. Published by threshold_publisher.py (treasury desk CLI). Consumed by ThresholdManager which broadcasts updates to all LiquidityPositionEngine instances. Topic is COMPACTED so full threshold state can be replayed on restart.",
+      "partitions": 1,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "cleanup_policy": "compact",
+      "producer": "threshold_publisher.py",
+      "consumers": [
+        "ThresholdManager (parallelism=1) → BroadcastState → LiquidityPositionEngine"
+      ],
+      "notes": "1 partition required — ThresholdManager parallelism=1 ensures single writer to BroadcastState. Compacted: key=currency:account keeps only latest threshold per account.",
+      "message_key": "currency:settlement_account (e.g. GBP:RTGS-GBP-001)",
+      "message_schema": {
+        "currency": "string",
+        "settlement_account": "string",
+        "warning_threshold": "number",
+        "critical_threshold": "number",
+        "updated_by": "string",
+        "updated_at": "string (ISO-8601 UTC)"
+      }
+    },
+    {
+      "name": "payments.dlq",
+      "description": "Dead Letter Queue for payment messages rejected by LiquidityPositionEngine. A message lands here if it fails JSON parsing, schema validation (missing fields, invalid enum values, non-positive amount), or timestamp parsing. Ops can consume this topic to debug upstream producer issues and republish corrected messages to payments.all for reprocessing.",
+      "partitions": 4,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "cleanup_policy": "delete",
+      "producer": "LiquidityPositionEngine (parse_payment DLQ path)",
+      "consumers": [
+        "ops team (manual inspection and replay)"
+      ],
+      "message_schema": {
+        "raw": "string (first 500 chars of the original message)",
+        "payment_id": "string | null (if extractable from the raw message)",
+        "error": "string (human-readable rejection reason)",
+        "stage": "string (json_parse | schema_validation | timestamp_parse)",
+        "detected_at": "string (ISO-8601 UTC timestamp when rejection was caught)"
+      },
+      "notes": "To replay: fix the upstream producer bug, then consume payments.dlq, correct the records, and republish to payments.all. Do not republish directly from DLQ without correction — the original message failed validation for a reason."
+    },
+    {
+      "name": "ops.feed.health",
+      "description": "Payment feed liveness events. FeedStaleAlert fires when no payment arrives on a rail for 60 seconds (Flink EventTimeTimer). Recovery events fire when feed resumes.",
+      "partitions": 4,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "cleanup_policy": "delete",
+      "producer": "LiquidityPositionEngine (on_timer callback)",
+      "consumers": [
+        "Feed Health Grafana panel",
+        "ops monitoring"
+      ],
+      "message_schema": {
+        "type": "string (feed_stale | feed_recovered)",
+        "key": "string (currency:settlement_account)",
+        "stale_since_ts": "number (epoch-ms)",
+        "detected_at_ts": "number (epoch-ms)"
+      }
+    }
+  ],
+  "summary": {
+    "total_topics": 9,
+    "payment_topics": 4,
+    "dlq_topics": 1,
+    "alert_topics": 2,
+    "control_topics": 1,
+    "ops_topics": 1,
+    "total_partitions": 72
+  }
+}

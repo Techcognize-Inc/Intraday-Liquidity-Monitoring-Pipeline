@@ -1,33 +1,38 @@
 # Intraday Liquidity Monitoring Pipeline
 
-**Project Code:** DE-PRJ-004  
-**Division:** Enterprise Banking — Treasury Operations  
-**Status:** In Development  
-**Last Updated:** March 2026
+**Project Code:** DE-PRJ-004
+**Division:** Enterprise Banking — Treasury Operations
+**Status:** In Development
+**Last Updated:** April 2026
 
 ---
 
 ## Table of Contents
 
-- [Executive Summary]
-- [Business Problem]
-- [Business Objectives]
-- [Business Value]
-- [Key Stakeholders]
-- [High-Level Architecture]
-- [Pipeline Components]
-- [Technology Stack]
-- [Advanced Flink Features]
-- [Scalability & Latency Targets]
-- [Dashboard Design]
-- [Data Sources]
-- [Acceptance Criteria]
+- [Executive Summary](#executive-summary)
+- [Business Problem](#business-problem)
+- [Business Objectives](#business-objectives)
+- [Business Value](#business-value)
+- [Key Stakeholders](#key-stakeholders)
+- [High-Level Architecture](#high-level-architecture)
+- [Pipeline Components](#pipeline-components)
+- [Data Quality & Resilience](#data-quality--resilience)
+- [Technology Stack](#technology-stack)
+- [Advanced Flink Features](#advanced-flink-features)
+- [Scalability & Latency Targets](#scalability--latency-targets)
+- [Dashboard Design](#dashboard-design)
+- [Data Sources](#data-sources)
+- [Acceptance Criteria](#acceptance-criteria)
+- [Getting Started](#getting-started)
+- [Repository Structure](#repository-structure)
 
 ---
 
 ## Executive Summary
 
 This project delivers a **Flink-native real-time liquidity position engine** that replaces the bank's current overnight batch-based liquidity calculation with a continuous streaming pipeline. The system updates available liquidity across all currencies and settlement accounts as payments flow in and out, alerts the treasury desk within seconds of a threshold breach, and provides a live Grafana command dashboard for intraday liquidity management.
+
+The pipeline includes a production-grade **data quality layer** with schema validation, amount range checks, duplicate payment detection, and a Dead Letter Queue (DLQ) — ensuring no malformed or duplicate record can corrupt the running balance.
 
 ---
 
@@ -40,7 +45,7 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 - In extreme cases, a missed **RTGS payment deadline** constitutes a direct regulatory breach, carrying penalties of **£1M+** per incident.
 - The earliest visibility into a developing liquidity shortfall is the next scheduled batch run — often hours too late for corrective action.
 
-**Current State:** Batch-computed position (stale by market open)  
+**Current State:** Batch-computed position (stale by market open)
 **Target State:** Continuous streaming position (updated within seconds of every payment event)
 
 ---
@@ -55,6 +60,7 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 | 4 | Enable treasury to adjust thresholds without system restart | New thresholds active in Flink within 30 seconds of publish |
 | 5 | Provide a live command dashboard for trading hours | Grafana dashboard with 5-second auto-refresh on wall monitors |
 | 6 | Address Basel III LCR intraday monitoring requirements | Full audit trail of position changes in time-series database |
+| 7 | Guarantee balance accuracy against malformed or duplicate data | Zero corrupt balance updates — all rejected records traceable in DLQ |
 
 ---
 
@@ -67,6 +73,7 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 | Proactive liquidity management | Visibility **30–60 minutes earlier** than any batch approach |
 | Basel III regulatory compliance | Directly addresses LCR intraday monitoring expectations |
 | Operational risk reduction | Eliminates blind spots during peak settlement windows |
+| Data quality protection | Duplicate payments and malformed records cannot corrupt the running balance |
 
 ---
 
@@ -76,7 +83,7 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 |------|---------------|
 | **Treasury Desk** | Primary user — monitors live position, adjusts thresholds, takes corrective action |
 | **Treasury Head** | Owns liquidity risk policy, sets warning/critical threshold levels |
-| **IT Operations** | Monitors Flink job health, feed connectivity, infrastructure |
+| **IT Operations** | Monitors Flink job health, feed connectivity, infrastructure, DLQ volumes |
 | **Regulatory Reporting** | Consumes position time-series for Basel III LCR reporting |
 | **Data Engineering** | Builds, deploys, and maintains the streaming pipeline |
 
@@ -108,6 +115,9 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 │                                                                         │
 │   liquidity.thresholds    liquidity.warnings    liquidity.critical      │
 │   (treasury updates)      (warning alerts)      (critical alerts)       │
+│                                                                         │
+│   payments.dlq            ops.feed.health                               │
+│   (rejected records)      (feed stale/recover events)                   │
 └────────────┬──────────────────────┬─────────────────────────────────────┘
              │                      │
              ▼                      ▼
@@ -116,24 +126,32 @@ The Treasury team currently calculates the bank's liquidity position **once per 
 │  ThresholdManager      │  │  LiquidityPositionEngine                   │
 │  (parallelism=1)       │  │  (parallelism=16, exactly-once)            │
 │                        │  │                                            │
-│  Reads threshold       │  │  KeyBy(currency + settlement_account)      │
-│  updates from Kafka    │──│  ValueState: running balance per key       │
-│  Distributes via       │  │  Threshold comparison on every update      │
-│  Broadcast State       │  │  EventTimeTimer: stale feed detection      │
+│  Reads threshold       │  │  parse_payment() — JSON + schema check     │
+│  updates from Kafka    │──│  validate_payment() — field + range check  │
+│  Distributes via       │  │  Duplicate detection via MapState          │
+│  Broadcast State       │  │  KeyBy(currency + settlement_account)      │
+│                        │  │  ValueState: running balance per key       │
+│  No restart required   │  │  Threshold comparison on every update      │
+│  for threshold changes │  │  EventTimeTimer: stale feed detection      │
 │                        │  │  Tumbling 5-min window: net flow summary   │
-│  No restart required   │  │  TwoPhaseCommit JDBC Sink                 │
-│  for threshold changes │  │  RocksDB + Incremental Checkpointing      │
+│                        │  │  TwoPhaseCommit JDBC Sink                  │
+│                        │  │  RocksDB + Incremental Checkpointing       │
 └────────────────────────┘  └──────────────────┬─────────────────────────┘
                                                │
-                                               ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         POSTGRESQL                                      │
-│                                                                         │
-│   liquidity_positions (time-series)    liquidity_flow_summary           │
-│   pending_payments                     feed_health_status               │
-└────────────────────────┬────────────────────────────────────────────────┘
-                         │
-                         ▼
+                              ┌────────────────┴──────────────────┐
+                              ▼                                   ▼
+              ┌───────────────────────────┐       ┌──────────────────────────┐
+              │        POSTGRESQL         │       │     payments.dlq (Kafka) │
+              │                           │       │                          │
+              │  liquidity_positions      │       │  Bad JSON                │
+              │  liquidity_flow_summary   │       │  Schema failures         │
+              │  alert_log                │       │  Amount out of range     │
+              │  feed_health              │       │  Duplicate payment_ids   │
+              │  pending_payments         │       │                          │
+              │  thresholds               │       │  Ops inspect + replay    │
+              └─────────────┬─────────────┘       └──────────────────────────┘
+                            │
+                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     MONITORING & DASHBOARD                              │
 │                                                                         │
@@ -165,6 +183,8 @@ Three upstream payment systems (RTGS, CHAPS, Internal Transfers) publish events 
 
 The core streaming engine. Maintains a **running balance** per (currency, settlement_account) pair using `ValueState` backed by RocksDB. On every payment event:
 
+- Validates schema and amount range — rejects malformed records to the DLQ
+- Checks for duplicate `payment_id` — skips balance update and routes to DLQ if seen before
 - **Inflow** → balance increases
 - **Outflow** → balance decreases
 - Compares updated balance against warning and critical thresholds
@@ -185,6 +205,79 @@ A morning Airflow DAG loads the day's scheduled payment file into a `pending_pay
 
 A wall-monitor-style command dashboard with 5-second auto-refresh, designed for continuous display on the treasury floor during trading hours. See [Dashboard Design](#dashboard-design) for panel details.
 
+### 6. Dead Letter Queue — `payments.dlq`
+
+A dedicated Kafka topic that receives every payment record rejected by the pipeline's data quality checks. Ops can consume this topic at any time to inspect failures, identify upstream producer bugs, and republish corrected records to `payments.all` for reprocessing. See [Data Quality & Resilience](#data-quality--resilience) for full details.
+
+---
+
+## Data Quality & Resilience
+
+All data quality checks are implemented in `flink_jobs/liquidity_position_engine.py`. Every rejection is routed to `payments.dlq` with a structured error record — nothing is silently dropped.
+
+### Schema Validation — `validate_payment()`
+
+Called on every parsed payment before any balance logic runs. Checks:
+
+| Check | Rule | Example Failure |
+|-------|------|-----------------|
+| Required fields | All 7 fields must be present | `"missing required field: 'amount'"` |
+| Currency | Must be `GBP`, `USD`, or `EUR` | `"invalid currency 'CHF'"` |
+| Direction | Must be `DEBIT` or `CREDIT` | `"invalid direction 'OUT'"` |
+| Rail | Must be `RTGS`, `CHAPS`, or `INTERNAL` | `"invalid rail 'SWIFT'"` |
+| Amount — numeric | Must be a parseable number | `"amount is not numeric: 'N/A'"` |
+| Amount — positive | Must be greater than zero | `"amount must be positive, got -5000"` |
+| Amount — range per rail | Must be within expected range for the rail | `"amount 900,000,000 is outside expected range for INTERNAL (100,000 – 50,000,000)"` |
+
+**Amount ranges per rail** (matching payment_producer.py):
+
+| Rail | Min | Max | Rationale |
+|------|-----|-----|-----------|
+| RTGS | £10M | £500M | Large-value Bank of England settlements |
+| CHAPS | £1M | £100M | Corporate same-day sterling transfers |
+| INTERNAL | £100K | £50M | Internal liquidity management sweeps |
+
+### Duplicate Payment Detection
+
+`LiquidityPositionFunction` maintains a `MapState<payment_id, event_time_ms>` per `(currency, settlement_account)` key, stored in RocksDB. On every payment:
+
+1. Check if `payment_id` is already in `seen_payments_state`
+2. If **duplicate** — skip balance update entirely, emit to `payments.dlq` with `stage: "duplicate_detection"`, return early
+3. If **new** — mark as seen, proceed with balance update
+
+This prevents Kafka at-least-once redelivery or producer retries from double-counting a payment (e.g. a £50M DEBIT processed twice = £100M wrongly deducted).
+
+> **Production note:** Add Flink state TTL (e.g. 24h) to `seen_payments_state` to prevent unbounded RocksDB growth.
+
+### Dead Letter Queue — `payments.dlq`
+
+All rejection paths funnel into a single Kafka topic. The DLQ record format:
+
+```json
+{
+  "raw":         "<first 500 chars of original message>",
+  "payment_id":  "<UUID if extractable, else null>",
+  "error":       "<human-readable rejection reason>",
+  "stage":       "json_parse | schema_validation | timestamp_parse | duplicate_detection",
+  "detected_at": "2026-04-02T09:15:00.123Z"
+}
+```
+
+**Rejection stages and their sources:**
+
+| Stage | Source | Meaning |
+|-------|--------|---------|
+| `json_parse` | `parse_payment()` | Message is not valid JSON |
+| `schema_validation` | `validate_payment()` | Missing field, bad enum, or amount out of range |
+| `timestamp_parse` | `parse_payment()` | `event_time` field cannot be parsed as ISO-8601 |
+| `duplicate_detection` | `LiquidityPositionFunction` | `payment_id` already processed for this account |
+
+**Ops replay workflow:** Consume `payments.dlq` → identify root cause → fix upstream producer → republish corrected records to `payments.all`.
+
+### Schema Registry (Production Path)
+
+The current implementation uses plain JSON strings with in-Flink validation. In production, this would be replaced with **Confluent Schema Registry + Avro**, which enforces schema at the Kafka broker level before messages reach Flink. This reduces DLQ volume significantly because malformed messages are rejected at publish time rather than at consumption time.
+
 ---
 
 ## Technology Stack
@@ -192,9 +285,9 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | Stream Processing | Apache Flink (PyFlink) | Real-time position engine, threshold monitoring, stale feed detection |
-| Message Broker | Apache Kafka | Event transport, partitioned by currency, 7-day retention |
-| State Backend | RocksDB | Persistent state for running balances, survives job restarts |
-| Database | PostgreSQL | Position time-series, flow summaries, pending payments |
+| Message Broker | Apache Kafka | Event transport, partitioned by currency, 7-day retention, DLQ topic |
+| State Backend | RocksDB | Persistent state for running balances and seen payment IDs, survives job restarts |
+| Database | PostgreSQL | Position time-series, flow summaries, pending payments, alert audit log |
 | Orchestration | Apache Airflow | Morning pending payments load, SLA monitoring |
 | Dashboard | Grafana | Live treasury command dashboard, 5-second refresh |
 | Metrics | Prometheus | Flink job metrics, backpressure monitoring, feed health |
@@ -207,6 +300,7 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 | Feature | Usage in This Project | Enterprise Rationale |
 |---------|----------------------|---------------------|
 | **ValueState + RocksDB** | Running balance per (currency, account) key. State survives job restarts without reprocessing history. | A running balance must be exact — any state loss means treasury sees incorrect position. RocksDB-backed ValueState with exactly-once guarantees correctness. |
+| **MapState (dedup)** | `seen_payments_state` tracks processed `payment_id`s per account key. Prevents duplicate payments from corrupting the balance on Kafka redelivery or producer retry. | A £50M DEBIT processed twice deducts £100M. In a financial pipeline, exactly-once semantics at the application level are as important as at the sink level. |
 | **Broadcast State** | ThresholdManager distributes threshold values to all subtasks. Treasury updates thresholds via Kafka with immediate effect. | Treasury adjusts thresholds multiple times per day based on expected payment flows. Broadcast State allows this without interrupting the position engine. |
 | **EventTimeTimers** | Fire if no payment event arrives for 60 seconds per currency — indicating a stale or disconnected payment feed. | A silent feed failure is as dangerous as a real liquidity shortage. Timers provide operational watchdog functionality that batch approaches cannot replicate. |
 | **Tumbling Window** | 5-minute event-time windows computing net inflow/outflow per currency. Feeds the Grafana net flow trend panel. | Tumbling windows on event time produce accurate 5-minute net flow figures even if payment events arrive slightly late. |
@@ -220,15 +314,16 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 | Metric | Target | How Achieved |
 |--------|--------|-------------|
 | **Payment Volume** | 50K payments/day, up to 500 TPS during settlement windows | 16 Kafka partitions keyed by currency. Flink parallelism=16. Linear scale-out by adding TaskManagers. |
-| **End-to-End Latency** | Position update in Grafana within 5 seconds of payment event | Flink processing < 100ms. JDBC sink writes every 10 seconds. Grafana refreshes every 5 seconds. |
+| **End-to-End Latency** | Position update in Grafana within 5 seconds of payment event | Flink processing < 100ms. JDBC sink writes every 1 second. Grafana refreshes every 5 seconds. |
 | **State Recovery** | Correct state restored in under 2 minutes after failure | RocksDB incremental checkpoints every 30 seconds. Kafka retains 7 days for replay if checkpoint lost. |
-| **Threshold Propagation** | New threshold active within 10 seconds of treasury publishing | Broadcast State propagation within one checkpoint interval (30 seconds max). |
+| **Threshold Propagation** | New threshold active within 30 seconds of treasury publishing | Broadcast State propagation within one checkpoint interval. |
+| **DLQ Visibility** | Rejected records available for ops inspection within seconds | `payments.dlq` is a standard Kafka topic — consumable immediately, 7-day retention. |
 
 ---
 
 ## Dashboard Design
 
-**Tool:** Grafana — `localhost:3000` (5-second auto-refresh)  
+**Tool:** Grafana — `localhost:3000` (5-second auto-refresh)
 **Provisioning:** Fully provisioned via `grafana_dashboard.json` — importable in one step, no manual configuration.
 
 ### Dashboard Panels
@@ -251,13 +346,15 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 
 | Source | Format | Volume | Partitioning |
 |--------|--------|--------|-------------|
-| RTGS Gateway | Kafka events (JSON) | ~20K payments/day | By currency |
-| CHAPS Payments | Kafka events (JSON) | ~15K payments/day | By currency |
-| Internal Transfers | Kafka events (JSON) | ~15K payments/day | By currency |
+| RTGS Gateway | Kafka events (JSON) | ~221K payments/day | By currency |
+| CHAPS Payments | Kafka events (JSON) | ~133K payments/day | By currency |
+| Internal Transfers | Kafka events (JSON) | ~443K payments/day | By currency |
 | Pending Payments File | CSV (morning load) | ~500 records/day | N/A |
 | Threshold Updates | Kafka events (JSON) | Ad-hoc (treasury driven) | Single partition |
 
-**Simulation:** All payment sources generated via Faker with realistic intraday volume patterns — heavy outflows 09:00–11:00, heavy inflows 14:00–16:00. Configurable failure injection for feed dropout simulation.
+**Total synthetic volume:** ~797K unique payment events/day (~1.6M Kafka messages/day including fan-out to `payments.all`). Peak rate: 18 payments/sec during business hours (07:00–18:00 UTC), 1.8 payments/sec overnight.
+
+**Simulation:** All payment sources generated via Faker with realistic intraday volume patterns. Configurable failure injection for feed dropout simulation.
 
 ---
 
@@ -271,6 +368,8 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 | AC-4 | Update threshold via `liquidity.thresholds` Kafka topic — Flink applies new threshold within 30 seconds, no job restart | Publish threshold, verify next breach uses new value |
 | AC-5 | Simulate payment feed dropout — FeedStaleAlert fires within 60 seconds, Feed Health panel turns amber | Stop payment producer for one currency, observe alert |
 | AC-6 | Kill Flink job, restart — balance resumes from correct value (RocksDB checkpoint restored) | Compare pre-kill balance with post-restart balance |
+| AC-7 | Publish malformed payment (missing field / invalid currency / amount out of range) — record appears in `payments.dlq`, balance unchanged | Consume `payments.dlq`, verify error field and stage |
+| AC-8 | Publish identical `payment_id` twice — second message routed to `payments.dlq` with `stage: duplicate_detection`, balance debited only once | Send duplicate, verify single debit in `liquidity_positions` and DLQ entry |
 
 ---
 
@@ -280,20 +379,20 @@ A wall-monitor-style command dashboard with 5-second auto-refresh, designed for 
 # 1. Start infrastructure
 docker-compose up -d kafka zookeeper postgresql grafana prometheus
 
-# 2. Create Kafka topics
+# 2. Create Kafka topics (includes payments.dlq)
 ./scripts/create_topics.sh
 
 # 3. Start Flink cluster
 ./scripts/start_flink_cluster.sh
 
 # 4. Deploy ThresholdManager job
-flink run -py jobs/threshold_manager.py
+flink run -py flink_jobs/threshold_manager.py
 
 # 5. Deploy LiquidityPositionEngine job
-flink run -py jobs/liquidity_position_engine.py
+flink run -py flink_jobs/liquidity_position_engine.py
 
 # 6. Start payment producer (simulated data)
-python producers/payment_producer.py --tps 50
+python -m producers.payment_producer
 
 # 7. Load Grafana dashboard
 curl -X POST http://localhost:3000/api/dashboards/db -d @grafana/grafana_dashboard.json
@@ -311,27 +410,32 @@ airflow webserver &
 intraday-liquidity-monitoring/
 ├── README.md
 ├── docker-compose.yml
-├── jobs/
-│   ├── liquidity_position_engine.py      # Flink Job 1: Position engine
-│   └── threshold_manager.py              # Flink Job 2: Threshold broadcast
+├── requirements.txt
+├── flink_jobs/
+│   ├── liquidity_position_engine.py      # Flink Job 1: Position engine, DQ checks, DLQ routing
+│   └── threshold_manager.py              # Flink Job 2: Threshold broadcast via BroadcastState
 ├── producers/
-│   ├── payment_producer.py               # Faker-based payment event generator
-│   └── threshold_publisher.py            # Threshold update publisher
+│   ├── payment_producer.py               # Faker-based payment event generator (3 rails, TPS-controlled)
+│   ├── pending_payments_generator.py     # Generates pending payment schedule
+│   └── threshold_publisher.py            # Treasury desk CLI for publishing threshold updates
 ├── dags/
-│   └── pending_payments_dag.py           # Airflow morning DAG
-├── sql/
-│   ├── schema.sql                        # PostgreSQL table definitions
-│   └── seed_thresholds.sql               # Default threshold values
+│   └── pending_payments_dag.py           # Airflow morning DAG — loads pending payments to PostgreSQL
+├── postgresql/
+│   ├── schema.sql                        # Table definitions: positions, alerts, thresholds, feed_health
+│   └── seed_thresholds.sql               # Default WARNING/CRITICAL threshold values per account
 ├── grafana/
-│   ├── grafana_dashboard.json            # Full dashboard provisioning
-│   └── datasources.yml                   # PostgreSQL + Prometheus config
+│   ├── grafana_dashboard.json            # Full dashboard provisioning (importable)
+│   ├── datasources.yml                   # PostgreSQL + Prometheus datasource config
+│   └── dashboard-provisioning.yml        # Grafana provisioning config
 ├── config/
 │   ├── flink-conf.yaml                   # Flink cluster configuration
-│   └── kafka-topics.json                 # Topic definitions
+│   ├── kafka-topics.json                 # Topic definitions including payments.dlq
+│   └── prometheus.yml                    # Prometheus scrape config
 ├── scripts/
-│   ├── create_topics.sh
+│   ├── create_topics.sh                  # Creates all Kafka topics including payments.dlq
 │   └── start_flink_cluster.sh
 └── tests/
+    ├── test_payment_producer.py
     ├── test_position_engine.py
     ├── test_threshold_broadcast.py
     └── test_stale_feed_detection.py

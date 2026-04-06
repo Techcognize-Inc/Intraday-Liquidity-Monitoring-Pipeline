@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────
+#  Flink Docker Image — Intraday Liquidity Monitoring Pipeline
+#
+#  What this builds:
+#    A custom Flink image that adds Python support and all the
+#    connector JARs needed to run our PyFlink jobs.
+#
+#  Why a custom image?
+#    The official flink:1.18.1 image only has Java.
+#    Our jobs are written in Python (PyFlink), and need:
+#      - Python 3.11 runtime
+#      - apache-flink Python package (PyFlink)
+#      - Kafka connector JAR (to read from Kafka topics)
+#      - JDBC connector JAR (to write to PostgreSQL)
+#      - PostgreSQL JDBC driver JAR (the actual DB driver)
+#      - Prometheus metrics reporter JAR (for Grafana dashboards)
+# ─────────────────────────────────────────────────────────────────
+
+# Start from the official Flink base image
+# flink:1.18.1        = Flink version 1.18.1
+# scala_2.12          = compiled with Scala 2.12 (needed by Kafka connector)
+# java11              = runs on Java 11 JVM
+FROM flink:1.18.1-scala_2.12-java11
+
+# ── Build arguments (ARG = build-time variable, can be overridden with --build-arg) ──
+ARG FLINK_VERSION=1.18.1           # must match the base image version
+ARG SCALA_VERSION=2.12             # must match base image Scala version
+ARG KAFKA_CONNECTOR_VERSION=3.1.0-1.18   # Kafka SQL connector version for Flink 1.18
+ARG JDBC_CONNECTOR_VERSION=3.1.2-1.18    # JDBC connector version for Flink 1.18
+ARG PG_JDBC_VERSION=42.7.3               # PostgreSQL JDBC driver version
+ARG PYFLINK_VERSION=1.18.1               # PyFlink version — must match Flink base image
+
+# ── System packages ───────────────────────────────────────────────
+# Install Python 3.11 and tools needed to run PyFlink jobs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \           # Python 3.11 runtime
+        python3.11-dev \       # Python headers (needed to compile some pip packages)
+        python3-pip \          # pip package manager
+        python3.11-venv \      # virtual environment support
+        curl \                 # for health checks and downloading
+        wget \                 # for downloading JAR files below
+        procps \               # for process management (ps command)
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \   # make python3 point to 3.11
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \    # make python point to 3.11
+    && apt-get clean \                                  # remove apt cache to reduce image size
+    && rm -rf /var/lib/apt/lists/*                      # delete downloaded package lists
+
+# ── Python packages ───────────────────────────────────────────────
+# Install the Python libraries our Flink jobs need
+RUN pip3 install --no-cache-dir \          # --no-cache-dir keeps image smaller
+    apache-flink==${PYFLINK_VERSION} \     # PyFlink — the Python API for Apache Flink
+    psycopg2-binary==2.9.9 \              # PostgreSQL driver (binary = no compilation needed)
+    kafka-python==2.0.2 \                 # Python Kafka client (used in some utility scripts)
+    prometheus-client==0.20.0 \           # Prometheus metrics client
+    python-dateutil==2.9.0                # date parsing utilities
+
+# ── Flink connector JARs ──────────────────────────────────────────
+# JARs go in /opt/flink/lib/ — Flink's classloader automatically
+# picks up ALL JARs in this directory when starting a job.
+# No code changes needed — just dropping the JAR here is enough.
+WORKDIR /opt/flink/lib
+
+# JAR 1: Kafka SQL Connector
+# Enables Flink to read from and write to Kafka topics.
+# Used by KafkaSource and KafkaSink in liquidity_position_engine.py.
+RUN wget -q \
+    "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/${KAFKA_CONNECTOR_VERSION}/flink-sql-connector-kafka-${KAFKA_CONNECTOR_VERSION}.jar" \
+    -O flink-sql-connector-kafka.jar   # save with a clean filename
+
+# JAR 2: JDBC Connector
+# Enables Flink to write to relational databases via JDBC.
+# Used by JdbcSink in liquidity_position_engine.py for PostgreSQL writes.
+RUN wget -q \
+    "https://repo1.maven.org/maven2/org/apache/flink/flink-connector-jdbc/${JDBC_CONNECTOR_VERSION}/flink-connector-jdbc-${JDBC_CONNECTOR_VERSION}.jar" \
+    -O flink-connector-jdbc.jar
+
+# JAR 3: PostgreSQL JDBC Driver
+# The actual PostgreSQL database driver — needed by flink-connector-jdbc
+# to talk to PostgreSQL (the connector itself is DB-agnostic).
+RUN wget -q \
+    "https://repo1.maven.org/maven2/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar" \
+    -O postgresql.jar
+
+# JAR 4: Prometheus Metrics Reporter
+# Exposes Flink's internal metrics (throughput, latency, checkpoint duration, etc.)
+# on an HTTP endpoint that Prometheus scrapes every 10 seconds.
+# This is what powers the Flink metrics panels in Grafana.
+RUN wget -q \
+    "https://repo1.maven.org/maven2/org/apache/flink/flink-metrics-prometheus/${FLINK_VERSION}/flink-metrics-prometheus-${FLINK_VERSION}.jar" \
+    -O flink-metrics-prometheus.jar
+
+# ── Copy Flink job Python files ───────────────────────────────────
+# Switch back to /opt/flink as working directory
+WORKDIR /opt/flink
+
+# Copy our Python job files into the container
+# flink_jobs/ contains liquidity_position_engine.py and threshold_manager.py
+COPY flink_jobs/ /opt/flink/jobs/
+
+# Copy our custom Flink config (checkpointing, parallelism, metrics settings)
+COPY config/flink-conf.yaml /opt/flink/conf/flink-conf.yaml
+
+# ── Create checkpoint and savepoint directories ───────────────────
+# Flink writes RocksDB checkpoints here for fault tolerance.
+# On restart, Flink reads from here to restore state (acceptance criterion #6).
+RUN mkdir -p /opt/flink/checkpoints /opt/flink/savepoints \
+    && chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints
+    # chown = change ownership to the 'flink' user (not root, for security)
+
+# ── Set PYTHONPATH so PyFlink can find our job modules ────────────
+# Without this, `from flink_jobs.liquidity_position_engine import ...` would fail
+ENV PYTHONPATH="/opt/flink/jobs:${PYTHONPATH:-}"
+# /opt/flink/jobs is prepended to the Python module search path
+
+# Switch to non-root 'flink' user for security
+# Running as root inside a container is a security risk
+USER flink

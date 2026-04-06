@@ -1,0 +1,437 @@
+version: "3.8" # docker-compose file format version
+
+# ─────────────────────────────────────────────────────────────────
+#  Intraday Liquidity Monitoring Pipeline — docker-compose.yml
+#
+#  This file defines ALL 10 services that make up the pipeline.
+#  Run with: docker-compose up -d
+#
+#  Services:
+#    zookeeper       — Kafka's coordination service
+#    kafka           — Message broker (all payment events flow through here)
+#    schema-registry — Manages Avro schemas for Kafka messages
+#    kafka-init      — One-shot: creates all 8 Kafka topics, then exits
+#    postgres        — Stores positions, thresholds, alerts, pending payments
+#    flink-jobmanager — Flink master: schedules and monitors jobs
+#    flink-taskmanager — Flink worker: executes the jobs (parallelism=16)
+#    payment-producer — Generates fake payment events and publishes to Kafka
+#    prometheus      — Collects metrics from Flink
+#    grafana         — Displays the live dashboard
+# ─────────────────────────────────────────────────────────────────
+
+# ── Shared Flink configuration (YAML anchor) ─────────────────────
+# x-flink-common is a YAML anchor — it defines shared config that
+# both flink-jobmanager and flink-taskmanager inherit with <<: *flink-common
+# This avoids repeating the same env vars in both services.
+x-flink-common: &flink-common
+  image: liquidity-flink:latest # name for the built image
+  build:
+    context: . # build context is the project root
+    dockerfile: docker/Dockerfile.flink # which Dockerfile to use
+  environment:
+    FLINK_PROPERTIES: | # multi-line Flink config (pipe | = literal block)
+      jobmanager.rpc.address: flink-jobmanager        # address TaskManagers use to reach JobManager
+      taskmanager.numberOfTaskSlots: 16               # each TM has 16 slots (= 16 parallel tasks)
+      parallelism.default: 4                          # default parallelism if not specified per job
+      state.backend: rocksdb                          # use RocksDB for state storage (disk-based, large state)
+      state.backend.rocksdb.localdir: /tmp/flink/rocksdb  # local disk path for RocksDB data
+      state.checkpoints.dir: file:///opt/flink/checkpoints   # where to write checkpoint snapshots
+      state.savepoints.dir: file:///opt/flink/savepoints     # where to write savepoints (manual snapshots)
+      execution.checkpointing.interval: 10000         # checkpoint every 10,000ms (10 seconds)
+      execution.checkpointing.mode: EXACTLY_ONCE      # strongest consistency guarantee
+      execution.checkpointing.min-pause: 5000         # at least 5s gap between checkpoints
+      execution.checkpointing.timeout: 60000          # checkpoint must complete within 60s or abort
+      restart-strategy: fixed-delay                   # restart failed jobs automatically
+      restart-strategy.fixed-delay.attempts: 3        # try restarting up to 3 times
+      restart-strategy.fixed-delay.delay: 10s         # wait 10s between restart attempts
+      metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory  # enable Prometheus
+      metrics.reporter.prom.port: 9249                # expose metrics on this port
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092 # Kafka address (docker service name resolves to container IP)
+    POSTGRES_HOST: postgres # PostgreSQL hostname (docker service name)
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: liquidity
+    POSTGRES_USER: liquidity_user
+    POSTGRES_PASSWORD: liquidity_pass
+  depends_on:
+    kafka:
+      condition: service_healthy # wait until Kafka passes its health check
+    postgres:
+      condition: service_healthy # wait until PostgreSQL passes its health check
+  volumes:
+    - flink-checkpoints:/opt/flink/checkpoints # named volume: persists checkpoints across restarts
+    - flink-savepoints:/opt/flink/savepoints # named volume: persists savepoints
+  networks:
+    - liquidity-net # all services on the same network so they can reach each other by name
+
+services:
+  # ──────────────────────────────────────────────────────────────
+  #  ZOOKEEPER
+  #  Kafka's distributed coordination service.
+  #  Manages broker metadata, leader election, and consumer groups.
+  #  Required by Kafka — Kafka cannot start without Zookeeper.
+  # ──────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0 # Confluent Platform Zookeeper (matches Kafka version)
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181 # port clients (Kafka) connect to
+      ZOOKEEPER_TICK_TIME: 2000 # basic time unit (ms) for heartbeats and timeouts
+      ZOOKEEPER_SYNC_LIMIT: 2 # max ticks a follower can be behind the leader
+    ports:
+      - "2181:2181" # expose to host so you can inspect Zookeeper from your machine
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data # persist Zookeeper data across container restarts
+      - zookeeper-log:/var/lib/zookeeper/log # persist transaction logs
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+      # "ruok" = "are you ok?" — Zookeeper responds "imok" if healthy
+      interval: 10s # check every 10 seconds
+      timeout: 5s # fail if no response within 5 seconds
+      retries: 5 # mark unhealthy after 5 consecutive failures
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  KAFKA
+  #  The central message broker.
+  #  All payment events flow through Kafka topics.
+  #  Flink reads from Kafka; payment_producer writes to Kafka.
+  # ──────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0 # Confluent Platform Kafka
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy # Kafka cannot start without a healthy Zookeeper
+    ports:
+      - "9092:9092" # INTERNAL port — used by other containers (Flink, producer)
+      - "9093:9093" # EXTERNAL port — used when connecting from your host machine (e.g. kafka-ui)
+    environment:
+      KAFKA_BROKER_ID: 1 # unique broker ID (we have 1 broker)
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181 # Zookeeper address
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      # 0.0.0.0 = listen on all network interfaces for both listeners
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9093
+      # INTERNAL: other containers connect using "kafka:9092" (docker hostname)
+      # EXTERNAL: your host machine connects using "localhost:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # Both listeners use plain text (no SSL — dev environment only)
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL # brokers talk to each other on INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1 # only 1 broker so replication factor = 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # same — needed for exactly-once
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1 # min in-sync replicas = 1
+      KAFKA_LOG_RETENTION_HOURS: 24 # keep messages for 24 hours then delete
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824 # 1GB per log segment file
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # don't auto-create topics — kafka-init creates them explicitly
+    volumes:
+      - kafka-data:/var/lib/kafka/data # persist Kafka log data across restarts
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      # checks if the broker is responding to API calls
+      interval: 15s
+      timeout: 10s
+      retries: 8 # more retries because Kafka takes longer to start than Zookeeper
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  SCHEMA REGISTRY
+  #  Manages Avro schemas for Kafka messages.
+  #  Ensures producer and consumer agree on message format.
+  #  The payment_producer uses it to register payment event schemas.
+  # ──────────────────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy # needs Kafka to be running first
+    ports:
+      - "8081:8081" # Schema Registry REST API (can browse schemas at http://localhost:8081)
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry # hostname for this service
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092 # which Kafka to store schemas in
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081 # listen on all interfaces
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"] # /subjects returns list of schemas
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  KAFKA TOPIC INITIALISER
+  #  Runs create_topics.sh ONCE to create all 8 Kafka topics,
+  #  then exits with code 0. Docker marks it "completed".
+  #  Other services that need topics use: depends_on kafka-init
+  # ──────────────────────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0 # reuse the Kafka image — has kafka-topics CLI
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"] # run our script as the container command
+    volumes:
+      - ./scripts/create_topics.sh:/scripts/create_topics.sh:ro # mount script read-only
+    networks:
+      - liquidity-net
+    restart: "no" # don't restart after it exits — it's a one-shot initialiser
+
+  # ──────────────────────────────────────────────────────────────
+  #  POSTGRESQL
+  #  Stores all persistent data:
+  #    liquidity_positions    — real-time balances (Flink writes here)
+  #    liquidity_flow_summary — 5-min window aggregates
+  #    thresholds             — alert thresholds (hot-reloaded)
+  #    feed_health            — stale feed status
+  #    pending_payments       — upcoming payments (Airflow writes here)
+  #    alert_log              — audit trail of all alerts
+  # ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine # Alpine = small image; 15 = PostgreSQL version 15
+    container_name: postgres
+    environment:
+      POSTGRES_DB: liquidity # create this database on first start
+      POSTGRES_USER: liquidity_user # create this user
+      POSTGRES_PASSWORD: liquidity_pass
+    ports:
+      - "5432:5432" # expose to host so you can connect with psql or DBeaver
+    volumes:
+      - postgres-data:/var/lib/postgresql/data # persist database files across restarts
+      - ./postgresql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      # postgres image auto-runs scripts in /docker-entrypoint-initdb.d/ on first start
+      # 01_schema.sql runs first — creates all 6 tables
+      - ./postgresql/seed_thresholds.sql:/docker-entrypoint-initdb.d/02_seed_thresholds.sql:ro
+      # 02_seed_thresholds.sql runs second — inserts initial threshold values
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liquidity_user -d liquidity"]
+      # pg_isready = built-in PostgreSQL tool that checks if the DB is accepting connections
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  FLINK JOB MANAGER
+  #  The "master" of the Flink cluster.
+  #  Responsibilities:
+  #    - Accepts job submissions (via REST API or flink run CLI)
+  #    - Schedules tasks across TaskManagers
+  #    - Monitors job health and triggers restarts on failure
+  #    - Coordinates checkpoints
+  #  Web UI available at http://localhost:8080
+  # ──────────────────────────────────────────────────────────────
+  flink-jobmanager:
+    <<: *flink-common # inherit all settings from x-flink-common (image, env, volumes, network)
+    container_name: flink-jobmanager
+    command: jobmanager # tell the Flink entrypoint to start in JobManager mode
+    ports:
+      - "8080:8081" # Flink Web UI (host:8080 → container:8081)
+      - "9249:9249" # Prometheus metrics endpoint
+    environment:
+      <<: *flink-common # merge with the anchor's environment
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1600m   # 1.6GB for the JobManager process
+        taskmanager.numberOfTaskSlots: 16
+        parallelism.default: 4
+        state.backend: rocksdb
+        state.backend.rocksdb.localdir: /tmp/flink/rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+        execution.checkpointing.interval: 10000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.min-pause: 5000
+        execution.checkpointing.timeout: 60000
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: liquidity
+      POSTGRES_USER: liquidity_user
+      POSTGRES_PASSWORD: liquidity_pass
+
+  # ──────────────────────────────────────────────────────────────
+  #  FLINK TASK MANAGER
+  #  The "worker" of the Flink cluster.
+  #  Responsibilities:
+  #    - Executes the actual streaming tasks (our Python job code)
+  #    - Manages state storage in RocksDB
+  #    - Sends metrics to Prometheus
+  #  16 slots = can run 16 tasks in parallel (matches Kafka partition count)
+  # ──────────────────────────────────────────────────────────────
+  flink-taskmanager:
+    <<: *flink-common # inherit shared config
+    container_name: flink-taskmanager
+    command: taskmanager # start in TaskManager mode
+    depends_on:
+      flink-jobmanager:
+        condition: service_started # JobManager must be up first
+    environment:
+      <<: *flink-common
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 4096m      # 4GB — larger because TM holds RocksDB state
+        taskmanager.memory.managed.fraction: 0.4    # 40% of managed memory for RocksDB
+        taskmanager.numberOfTaskSlots: 16           # 16 parallel task slots
+        parallelism.default: 4
+        state.backend: rocksdb
+        state.backend.rocksdb.localdir: /tmp/flink/rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+        execution.checkpointing.interval: 10000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.min-pause: 5000
+        execution.checkpointing.timeout: 60000
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 10s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: liquidity
+      POSTGRES_USER: liquidity_user
+      POSTGRES_PASSWORD: liquidity_pass
+    ports:
+      - "9250:9249" # TM Prometheus metrics mapped to 9250 on host (9249 already used by JM)
+
+  # ──────────────────────────────────────────────────────────────
+  #  PAYMENT PRODUCER
+  #  Generates synthetic RTGS/CHAPS/Internal payment events.
+  #  Publishes to Kafka topics at configurable TPS rates.
+  #  Simulates a real bank's payment processing system.
+  # ──────────────────────────────────────────────────────────────
+  payment-producer:
+    image: liquidity-producer:latest
+    build:
+      context: . # build from project root
+      dockerfile: docker/Dockerfile.producer # use the producer Dockerfile
+    container_name: payment-producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully # topics must exist before we can publish to them
+      schema-registry:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      RTGS_TPS: "5" # 5 RTGS payments per second
+      CHAPS_TPS: "3" # 3 CHAPS payments per second
+      INTERNAL_TPS: "10" # 10 internal transfers per second
+      BUSINESS_HOURS_START: "07:00" # start full-rate production at 07:00 UTC
+      BUSINESS_HOURS_END: "18:00" # drop to 10% rate after 18:00 UTC
+      CURRENCIES: "GBP,USD,EUR" # generate payments for these 3 currencies
+    volumes:
+      - ./producers:/app/producers:ro # mount producers code read-only (live code reload)
+    restart: unless-stopped # restart if the container crashes, but not if manually stopped
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  PROMETHEUS
+  #  Time-series metrics database.
+  #  Scrapes (pulls) metrics from Flink's /metrics HTTP endpoint
+  #  every 10 seconds and stores them.
+  #  Grafana queries Prometheus to display Flink performance panels.
+  # ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0 # official Prometheus image
+    container_name: prometheus
+    ports:
+      - "9090:9090" # Prometheus web UI and API (http://localhost:9090)
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro # our scrape config
+      - prometheus-data:/prometheus # persist metrics database
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml" # use our config file
+      - "--storage.tsdb.path=/prometheus" # store metrics here
+      - "--storage.tsdb.retention.time=7d" # keep 7 days of metrics
+      - "--web.enable-lifecycle" # allow POST /-/reload to reload config
+    depends_on:
+      - flink-jobmanager # Flink must be running for metrics to be available
+      - flink-taskmanager
+    networks:
+      - liquidity-net
+
+  # ──────────────────────────────────────────────────────────────
+  #  GRAFANA
+  #  Visualisation platform — our live dashboard.
+  #  Connects to PostgreSQL (for positions/alerts) and
+  #  Prometheus (for Flink metrics).
+  #  Configured with 5-second auto-refresh.
+  #  Dashboard and datasources are provisioned automatically from files.
+  # ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0 # official Grafana image
+    container_name: grafana
+    ports:
+      - "3000:3000" # Grafana web UI (http://localhost:3000)
+    environment:
+      GF_SECURITY_ADMIN_USER: admin # default admin username
+      GF_SECURITY_ADMIN_PASSWORD: admin # default admin password (change in production!)
+      GF_AUTH_ANONYMOUS_ENABLED: "true" # allow viewing dashboard without login
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer # anonymous users get view-only access
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 5s # allow dashboards to refresh as fast as every 5s
+      GF_DATABASE_TYPE: postgres # Grafana's own internal database (not our liquidity DB)
+      POSTGRES_HOST: postgres # passed to datasources.yml via provisioning
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: liquidity
+      POSTGRES_USER: liquidity_user
+      POSTGRES_PASSWORD: liquidity_pass
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      # ^ tells Grafana to auto-configure PostgreSQL and Prometheus as datasources on startup
+      - ./grafana/grafana_dashboard.json:/etc/grafana/provisioning/dashboards/liquidity_dashboard.json:ro
+      # ^ auto-loads our 5-panel dashboard on startup
+      - ./grafana/dashboard-provisioning.yml:/etc/grafana/provisioning/dashboards/dashboard-provisioning.yml:ro
+      # ^ tells Grafana where to look for dashboard JSON files
+      - grafana-data:/var/lib/grafana # persist Grafana settings across restarts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    networks:
+      - liquidity-net
+
+# ──────────────────────────────────────────────────────────────────
+#  NETWORKS
+#  All services are on the same bridge network.
+#  This lets services find each other by container name (e.g. "kafka")
+#  instead of IP address.
+# ──────────────────────────────────────────────────────────────────
+networks:
+  liquidity-net:
+    driver: bridge # standard Docker bridge network
+    name: liquidity-net
+
+# ──────────────────────────────────────────────────────────────────
+#  VOLUMES
+#  Named volumes are managed by Docker.
+#  They persist data even when containers are stopped or recreated.
+#  Remove with: docker-compose down -v  (WARNING: deletes all data)
+# ──────────────────────────────────────────────────────────────────
+volumes:
+  zookeeper-data: # Zookeeper metadata and snapshots
+  zookeeper-log: # Zookeeper transaction logs
+  kafka-data: # Kafka topic partition logs (the actual messages)
+  postgres-data: # PostgreSQL database files
+  flink-checkpoints: # Flink RocksDB checkpoints (enables balance restore on restart)
+  flink-savepoints: # Flink manual savepoints (for planned restarts/upgrades)
+  prometheus-data: # Prometheus time-series metrics database
+  grafana-data: # Grafana settings, users, alert rules

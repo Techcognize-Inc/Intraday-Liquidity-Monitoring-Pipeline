@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────
+#  Apache Flink Configuration
+#  Intraday Liquidity Monitoring Pipeline
+#  Mounted into flink-jobmanager and flink-taskmanager containers.
+#  FLINK_PROPERTIES env var in docker-compose overrides at runtime.
+# ─────────────────────────────────────────────────────────────────
+
+# ── Cluster ───────────────────────────────────────────────────────
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+jobmanager.memory.process.size: 1600m
+
+taskmanager.memory.process.size: 4096m
+taskmanager.memory.managed.fraction: 0.4
+taskmanager.numberOfTaskSlots: 16
+
+parallelism.default: 4
+
+# ── State Backend: RocksDB ─────────────────────────────────────────
+#  RocksDB handles large keyed state (ValueState<Double> per account)
+#  without blowing heap. Enables incremental checkpoints.
+state.backend: rocksdb
+state.backend.rocksdb.localdir: /tmp/flink/rocksdb
+state.backend.incremental: true
+
+# ── Checkpointing ─────────────────────────────────────────────────
+#  Exactly-once for TwoPhaseCommitSinkFunction -> PostgreSQL
+state.checkpoints.dir: file:///opt/flink/checkpoints
+state.savepoints.dir: file:///opt/flink/savepoints
+
+execution.checkpointing.interval: 10000 # 10s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.min-pause: 5000 # 5s between checkpoints
+execution.checkpointing.timeout: 60000 # 60s timeout
+execution.checkpointing.max-concurrent-checkpoints: 1
+
+# Keep last 3 checkpoints for recovery
+state.checkpoints.num-retained: 3
+
+# ── Restart Strategy ──────────────────────────────────────────────
+restart-strategy: fixed-delay
+restart-strategy.fixed-delay.attempts: 3
+restart-strategy.fixed-delay.delay: 10s
+
+# ── Metrics: Prometheus Reporter ──────────────────────────────────
+#  JM exposes on :9249, TM on :9249 (mapped to 9250 on host)
+metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prom.port: 9249
+metrics.reporter.prom.interval: 10 SECONDS
+
+# ── Web UI ────────────────────────────────────────────────────────
+rest.port: 8081
+web.submit.enable: true
+web.cancel.enable: true
+
+# ── Logging ───────────────────────────────────────────────────────
+akka.ask.timeout: 30s

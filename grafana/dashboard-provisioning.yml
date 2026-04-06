@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────────
+#  Grafana Dashboard Provisioning
+#  Intraday Liquidity Monitoring Pipeline
+#
+#  Tells Grafana to load dashboard JSON files from the mounted
+#  /etc/grafana/provisioning/dashboards/ directory.
+# ─────────────────────────────────────────────────────────────────
+
+apiVersion: 1
+
+providers:
+  - name: Liquidity Dashboards
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

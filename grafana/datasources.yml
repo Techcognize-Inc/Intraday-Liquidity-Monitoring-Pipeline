@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────
+#  Grafana Datasource Provisioning
+#  Intraday Liquidity Monitoring Pipeline
+#
+#  Datasources:
+#    1. PostgreSQL  — balance positions, flow summary, alerts
+#    2. Prometheus  — Flink JVM and operator metrics
+# ─────────────────────────────────────────────────────────────────
+
+apiVersion: 1
+
+datasources:
+  - name: PostgreSQL
+    type: postgres
+    uid: liquidity-postgres
+    url: postgres:5432
+    user: liquidity_user
+    secureJsonData:
+      password: liquidity_pass
+    jsonData:
+      database: liquidity
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+      postgresVersion: 1500
+      timescaledb: false
+    isDefault: true
+    editable: false
+
+  - name: Prometheus
+    type: prometheus
+    uid: liquidity-prometheus
+    url: http://prometheus:9090
+    jsonData:
+      httpMethod: POST
+      manageAlerts: false
+      prometheusType: Prometheus
+      prometheusVersion: 2.51.0
+    isDefault: false
+    editable: false

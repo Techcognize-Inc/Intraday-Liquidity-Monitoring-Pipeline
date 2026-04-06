@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────
+#  Intraday Liquidity Monitoring Pipeline — Python Dependencies
+#  Used by: Dockerfile.producer, local dev, Airflow DAG workers
+# ─────────────────────────────────────────────────────────────────
+
+# Kafka client (C-backed, high-throughput)
+confluent-kafka==2.4.0
+
+# Avro serialisation for Kafka messages
+fastavro==1.9.4
+
+# Schema Registry client (for Avro schema registration)
+confluent-kafka[avro]==2.4.0
+
+# Faker — synthetic RTGS/CHAPS/SWIFT payment event generation
+Faker==24.11.0
+
+# PostgreSQL driver — Airflow DAG and threshold publisher
+psycopg2-binary==2.9.9
+
+# Airflow (DAG worker only — not installed in producer container)
+apache-airflow==2.9.0
+
+# Prometheus metrics exposition for producer health
+prometheus-client==0.20.0
+
+# Utilities
+python-dateutil==2.9.0
+pytz==2024.1
+pydantic==2.7.1

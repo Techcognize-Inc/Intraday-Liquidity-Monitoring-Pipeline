@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────
+#  Payment Producer Image for Intraday Liquidity Monitoring Pipeline
+#
+#  Generates Faker RTGS/CHAPS/SWIFT payment events and publishes
+#  them to Kafka topics: payments.rtgs, payments.chaps, payments.internal
+#  Fan-out to payments.all handled by the producer itself.
+# ─────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# ── System dependencies ────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        librdkafka-dev \
+        curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies ────────────────────────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Application code ──────────────────────────────────────────────
+COPY producers/ ./producers/
+
+# ── Non-root user for security ────────────────────────────────────
+RUN useradd -m -u 1001 producer
+USER producer
+
+# ── Default environment (overridden in docker-compose) ────────────
+ENV KAFKA_BOOTSTRAP_SERVERS="kafka:9092" \
+    SCHEMA_REGISTRY_URL="http://schema-registry:8081" \
+    RTGS_TPS="5" \
+    CHAPS_TPS="3" \
+    INTERNAL_TPS="10" \
+    CURRENCIES="GBP,USD,EUR" \
+    BUSINESS_HOURS_START="07:00" \
+    BUSINESS_HOURS_END="18:00"
+
+CMD ["python", "-m", "producers.payment_producer"]
