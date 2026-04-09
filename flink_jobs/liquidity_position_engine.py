@@ -38,6 +38,7 @@ How data flows:
 import json                                    # for parsing Kafka JSON messages
 import logging                                 # for printing log messages to stdout
 import os                                      # for reading environment variables
+import time                                    # for wall-clock timestamps (processing-time timers)
 from datetime import datetime, timezone        # for timestamp conversions
 
 # ── Schema Registry note ───────────────────────────────────────────
@@ -330,7 +331,7 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
         # and via ctx inside process_broadcast_element (read-write).
         # It is NOT accessible through RuntimeContext — do not call get_broadcast_state here.
 
-    def process_broadcast_element(self, update: dict, ctx: KeyedBroadcastProcessFunction.Context, out):
+    def process_broadcast_element(self, update: dict, ctx: KeyedBroadcastProcessFunction.Context):
         """
         Called for each threshold update on the broadcast stream.
         Writes the updated thresholds into BroadcastState so all parallel
@@ -348,12 +349,12 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
         ctx.get_broadcast_state(THRESHOLD_STATE_DESCRIPTOR).put(threshold_key, threshold_value)
         logger.info(f"BroadcastState updated: key={threshold_key} thresholds={threshold_value}")
 
-    def process_element(self, payment: dict, ctx: KeyedBroadcastProcessFunction.ReadOnlyContext, out):
+    def process_element(self, payment: dict, ctx: KeyedBroadcastProcessFunction.ReadOnlyContext):
         """
         Called once per payment event.
         `payment` is the parsed dict from parse_payment().
         `ctx` gives access to timer service and current key.
-        `out` is the output collector — we call out.collect() to emit records.
+        Results are emitted via yield.
         """
         currency   = payment["currency"]              # e.g. "GBP"
         account    = payment["settlement_account"]   # e.g. "RTGS-GBP-001"
@@ -373,7 +374,7 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
                 f"Duplicate payment_id={payment_id} for key={currency}:{account} — "
                 f"skipping balance update, routing to DLQ"
             )
-            out.collect(("duplicate", {
+            yield ("duplicate", {
                 "payment_id":         payment_id,
                 "currency":           currency,
                 "settlement_account": account,
@@ -382,7 +383,7 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
                 "error":              f"duplicate payment_id already processed for {currency}:{account}",
                 "stage":              "duplicate_detection",
                 "detected_at":        datetime.now(tz=timezone.utc).isoformat(),
-            }))
+            })
             return   # do NOT update balance — early exit
 
         # Mark this payment_id as seen so any future redelivery is caught
@@ -417,12 +418,12 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
             if balance < critical_threshold:          # CRITICAL check first (more severe)
                 alert = self._build_alert("CRITICAL", currency, account, balance,
                                           critical_threshold, payment["payment_id"], event_ts)
-                out.collect(("alert", alert))         # emit as (type, record) tuple
+                yield ("alert", alert)                # emit as (type, record) tuple
 
             elif balance < warning_threshold:         # only WARNING if NOT already critical
                 alert = self._build_alert("WARNING", currency, account, balance,
                                           warning_threshold, payment["payment_id"], event_ts)
-                out.collect(("alert", alert))         # emit WARNING alert
+                yield ("alert", alert)                # emit WARNING alert
 
         # ── 3. Always emit a position record (goes to PostgreSQL) ─────
         # This runs regardless of whether an alert fired.
@@ -438,7 +439,7 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
             "last_payment_id":    payment["payment_id"],                # which payment triggered this update
             "event_time":         payment["event_time"],                # original ISO timestamp
         }
-        out.collect(("position", position))           # emit as (type, record) tuple
+        yield ("position", position)                  # emit as (type, record) tuple
 
         # ── 4. Manage the stale-feed detection timer ──────────────────
         # IDEA: Every payment resets a 60-second countdown.
@@ -446,15 +447,15 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
         # This detects payment feed outages (e.g. producer died, network issue).
         prev_timer = self.timer_registered.value()    # get timestamp of previously registered timer
         if prev_timer:
-            ctx.timer_service().delete_event_time_timer(prev_timer)  # cancel the old countdown
+            ctx.timer_service().delete_processing_time_timer(prev_timer)  # cancel the old countdown
 
-        new_timer = event_ts + STALE_FEED_TIMEOUT_MS  # schedule timer 60s from THIS payment's time
-        ctx.timer_service().register_event_time_timer(new_timer)     # register new countdown with Flink
+        new_timer = int(time.time() * 1000) + STALE_FEED_TIMEOUT_MS  # 60s from wall-clock NOW
+        ctx.timer_service().register_processing_time_timer(new_timer)     # register new countdown with Flink
         self.timer_registered.update(new_timer)       # remember this timer so we can cancel it next time
 
-    def on_timer(self, timestamp: int, ctx: KeyedProcessFunction.OnTimerContext, out):
+    def on_timer(self, timestamp: int, ctx: KeyedProcessFunction.OnTimerContext):
         """
-        Flink calls this method when a registered EventTimeTimer fires.
+        Flink calls this method when a registered ProcessingTimeTimer fires.
         We get here only if NO payment arrived in the last 60 seconds.
         This means the payment feed for this account has gone silent — a problem!
         """
@@ -464,7 +465,7 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
             "stale_since_ts":  timestamp - STALE_FEED_TIMEOUT_MS,        # when feed went silent
             "detected_at_ts":  timestamp,                                 # when we detected it
         }
-        out.collect(("feed_health", stale_event))     # emit to ops.feed.health Kafka topic
+        yield ("feed_health", stale_event)            # emit to ops.feed.health Kafka topic
         logger.warning(f"FeedStaleAlert: no payment for key={ctx.get_current_key()} in 60s")
 
     def _build_alert(self, alert_type, currency, account, balance, threshold, payment_id, event_ts):
@@ -497,67 +498,57 @@ class LiquidityPositionFunction(KeyedBroadcastProcessFunction):
 #    FlowWindowFunction    — fires once when window closes,
 #                            adds window timestamps to the result
 # ─────────────────────────────────────────────────────────────────
-class FlowAccumulator:
-    """A simple accumulator that sums up flows within a window."""
-    def __init__(self):
-        self.net_flow  = 0.0   # inbound minus outbound — positive = net inflow
-        self.inbound   = 0.0   # total credits in this window
-        self.outbound  = 0.0   # total debits in this window
-        self.count     = 0     # number of payments in this window
-
-
 class FlowAggregateFunction(AggregateFunction):
     """
     Flink calls add() for each payment as it arrives in the window.
-    Much more memory-efficient than storing all raw payments and aggregating at the end.
+    Uses a plain dict as accumulator so PyFlink can pickle it for state storage.
     """
     def create_accumulator(self):
-        return FlowAccumulator()                       # start with zero accumulator for each new window
+        return {"net_flow": 0.0, "inbound": 0.0, "outbound": 0.0, "count": 0}
 
-    def add(self, payment: dict, acc: FlowAccumulator):
+    def add(self, payment: dict, acc: dict):
         amount = float(payment["amount"])
         if payment["direction"] == "CREDIT":
-            acc.inbound  += amount                     # money received
-            acc.net_flow += amount                     # net flow goes up
-        else:                                          # DEBIT
-            acc.outbound += amount                     # money sent
-            acc.net_flow -= amount                     # net flow goes down
-        acc.count += 1                                 # count this payment
-        return acc                                     # return updated accumulator
+            acc["inbound"]  += amount
+            acc["net_flow"] += amount
+        else:
+            acc["outbound"] += amount
+            acc["net_flow"] -= amount
+        acc["count"] += 1
+        return acc
 
-    def get_result(self, acc: FlowAccumulator):
-        return acc                                     # pass the accumulator to FlowWindowFunction
+    def get_result(self, acc: dict):
+        return acc
 
-    def merge(self, a: FlowAccumulator, b: FlowAccumulator):
-        """Flink calls this when merging session windows — not used here but required."""
-        a.net_flow += b.net_flow
-        a.inbound  += b.inbound
-        a.outbound += b.outbound
-        a.count    += b.count
+    def merge(self, a: dict, b: dict):
+        a["net_flow"] += b["net_flow"]
+        a["inbound"]  += b["inbound"]
+        a["outbound"] += b["outbound"]
+        a["count"]    += b["count"]
         return a
 
 
 class FlowWindowFunction(ProcessWindowFunction):
     """
     Called once when the 5-minute window closes.
-    Receives the single aggregated FlowAccumulator and adds window metadata.
+    Receives the single aggregated dict and adds window metadata.
     """
-    def process(self, key, context, elements, out):
-        acc = list(elements)[0]                        # only one element — the aggregated accumulator
+    def process(self, key, context, elements):
+        acc = list(elements)[0]                        # only one element — the aggregated dict
         window = context.window()                      # the Window object with .start and .end (epoch-ms)
         currency, account = key.split(":", 1)          # split "GBP:RTGS-GBP-001" → ["GBP", "RTGS-GBP-001"]
         summary = {
             "type":               "flow_summary",
-            "window_start":       datetime.fromtimestamp(window.start / 1000, tz=timezone.utc).isoformat(),  # e.g. "2026-04-01T09:00:00+00:00"
-            "window_end":         datetime.fromtimestamp(window.end   / 1000, tz=timezone.utc).isoformat(),  # e.g. "2026-04-01T09:05:00+00:00"
+            "window_start":       datetime.fromtimestamp(window.start / 1000, tz=timezone.utc).isoformat(),
+            "window_end":         datetime.fromtimestamp(window.end   / 1000, tz=timezone.utc).isoformat(),
             "currency":           currency,
             "settlement_account": account,
-            "net_flow":           acc.net_flow,        # positive = net inflow, negative = net outflow
-            "total_inbound":      acc.inbound,
-            "total_outbound":     acc.outbound,
-            "payment_count":      acc.count,
+            "net_flow":           acc["net_flow"],
+            "total_inbound":      acc["inbound"],
+            "total_outbound":     acc["outbound"],
+            "payment_count":      acc["count"],
         }
-        out.collect(json.dumps(summary))               # emit as JSON string to JDBC sink
+        yield json.dumps(summary)                      # emit as JSON string to JDBC sink
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -772,7 +763,7 @@ def main():
     dlq_stream = (
         parsed
         .filter(lambda x: x[0] == "dlq")                      # keep only failed records
-        .map(lambda x: json.dumps(x[1]))                       # serialise error dict → JSON string
+        .map(lambda x: json.dumps(x[1]), output_type=Types.STRING())   # serialise error dict → JSON string
     )
 
     # ── Create the broadcast threshold stream ─────────────────────
@@ -809,7 +800,7 @@ def main():
     positions   = processed.filter(lambda x: x[0] == "position").map(lambda x: x[1])           # → PostgreSQL
     alerts      = processed.filter(lambda x: x[0] == "alert").map(lambda x: x[1])             # → Kafka alerts
     feed_health = processed.filter(lambda x: x[0] == "feed_health").map(lambda x: x[1])       # → Kafka ops topic
-    duplicates  = processed.filter(lambda x: x[0] == "duplicate").map(lambda x: json.dumps(x[1]))  # → payments.dlq
+    duplicates  = processed.filter(lambda x: x[0] == "duplicate").map(lambda x: json.dumps(x[1]), output_type=Types.STRING())  # → payments.dlq
 
     # ── Build Kafka sinks for alerts ───────────────────────────────
     # WARNING alerts go to liquidity.warnings topic
@@ -853,14 +844,14 @@ def main():
 
     # Route WARNING alerts to warnings topic, CRITICAL to critical topic
     (alerts.filter(lambda a: a["alert_type"] == "WARNING")   # only WARNING records
-           .map(json.dumps)                                   # dict → JSON string
+           .map(json.dumps, output_type=Types.STRING())        # dict → JSON string (explicit type for Java sink)
            .sink_to(warnings_sink))                           # write to Kafka
 
     (alerts.filter(lambda a: a["alert_type"] == "CRITICAL")  # only CRITICAL records
-           .map(json.dumps)
+           .map(json.dumps, output_type=Types.STRING())
            .sink_to(critical_sink))
 
-    feed_health.map(json.dumps).sink_to(feed_health_sink)      # stale events → ops topic
+    feed_health.map(json.dumps, output_type=Types.STRING()).sink_to(feed_health_sink)  # stale events → ops topic
 
     # ── 5-minute tumbling window for flow summary ──────────────────
     # Re-key the payments stream by currency:account

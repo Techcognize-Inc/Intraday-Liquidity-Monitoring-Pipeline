@@ -286,8 +286,10 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.memory.process.size: 4096m      # 4GB — larger because TM holds RocksDB state
-        taskmanager.memory.managed.fraction: 0.4    # 40% of managed memory for RocksDB
+        taskmanager.memory.process.size: 2048m      # 2GB — reduced to fit within 8GB host RAM
+        taskmanager.memory.managed.fraction: 0.3    # 30% of managed memory for RocksDB
+        taskmanager.memory.task.off-heap.size: 256m  # extra direct memory for Kafka network buffers
+        taskmanager.memory.framework.off-heap.size: 256m  # extra direct memory for Flink framework
         taskmanager.numberOfTaskSlots: 16           # 16 parallel task slots
         parallelism.default: 4
         state.backend: rocksdb
@@ -307,10 +309,13 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: liquidity
-      POSTGRES_USER: liquidity_user
       POSTGRES_PASSWORD: liquidity_pass
+      POSTGRES_USER: liquidity_user
+      # Disable jemalloc — causes JVM native crashes on WSL2
+      LD_PRELOAD: ""
     ports:
       - "9250:9249" # TM Prometheus metrics mapped to 9250 on host (9249 already used by JM)
+    restart: unless-stopped # restart automatically if the TM crashes
 
   # ──────────────────────────────────────────────────────────────
   #  PAYMENT PRODUCER

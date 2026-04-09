@@ -10,7 +10,7 @@ jobmanager.rpc.address: flink-jobmanager
 jobmanager.rpc.port: 6123
 jobmanager.memory.process.size: 1600m
 
-taskmanager.memory.process.size: 4096m
+taskmanager.memory.process.size: 2048m
 taskmanager.memory.managed.fraction: 0.4
 taskmanager.numberOfTaskSlots: 16
 

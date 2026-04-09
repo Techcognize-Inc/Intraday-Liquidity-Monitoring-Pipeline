@@ -187,9 +187,9 @@ def main() -> None:
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
 
-    # 3 parallel tasks — one per source topic is sufficient for a stateless merge job.
-    # Increase if rail volume grows beyond what 3 tasks can handle.
-    env.set_parallelism(3)
+    # 1 parallel task — reduced to stay within 16-slot TaskManager budget when
+    # running alongside LiquidityPositionEngine (which also uses several slots).
+    env.set_parallelism(1)
 
     # Checkpoint every 30 seconds so that on restart we resume from a recent
     # committed offset rather than replaying from the beginning.

@@ -99,6 +99,9 @@ COPY flink_jobs/ /opt/flink/jobs/
 
 # Copy our custom Flink config (checkpointing, parallelism, metrics settings)
 COPY config/flink-conf.yaml /opt/flink/conf/flink-conf.yaml
+# Allow the flink user to write to flink-conf.yaml so FLINK_PROPERTIES env var
+# overrides work at container startup (the entrypoint appends env config to this file)
+RUN chown flink:flink /opt/flink/conf/flink-conf.yaml
 
 # ── Create checkpoint and savepoint directories ───────────────────
 # Flink writes RocksDB checkpoints here for fault tolerance.
