@@ -60,12 +60,14 @@ from datetime import datetime, timezone        # for timestamp conversions
 
 # PyFlink imports — these are the Flink streaming API classes
 from pyflink.common import Time, WatermarkStrategy, Duration
+from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.common.serialization import SimpleStringSchema    # reads/writes plain strings
 from pyflink.common.typeinfo import Types                      # tells Flink what type each state field is
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,                        # reads messages from a Kafka topic
     KafkaOffsetsInitializer,            # controls where to start reading (earliest/latest/committed)
+    KafkaOffsetResetStrategy,           # fallback strategy for committed_offsets (EARLIEST/LATEST)
     KafkaSink,                          # writes messages to a Kafka topic
     KafkaRecordSerializationSchema,     # tells Kafka sink how to serialise records
 )
@@ -617,13 +619,89 @@ UPDATE_FEED_HEALTH_SQL = """
 
 
 # ─────────────────────────────────────────────────────────────────
+#  POSTGRESQL WRITERS (psycopg2-based, used as map-side-effect sinks)
+#
+#  PyFlink's Python SinkFunction is a Java wrapper and cannot be
+#  subclassed in Python.  The standard PyFlink pattern for custom
+#  Python sinks is a callable class used inside .map():
+#
+#      stream.map(PositionWriter()).print()
+#
+#  The callable writes to PostgreSQL as a side effect and returns a
+#  short log string.  The connection is opened lazily so the object
+#  survives Flink's pickle-based serialisation to task slots.
+# ─────────────────────────────────────────────────────────────────
+
+class _PgWriter:
+    """Base class: opens a psycopg2 connection lazily on first call."""
+
+    def __init__(self, sql):
+        self._sql = sql.replace("?", "%s")   # psycopg2 uses %s, not ?
+        self._conn = None
+
+    def _cursor(self):
+        if self._conn is None or self._conn.closed:
+            import psycopg2
+            self._conn = psycopg2.connect(
+                host=PG_HOST, port=int(PG_PORT), dbname=PG_DB,
+                user=PG_USER, password=PG_PASS,
+            )
+            self._conn.autocommit = True
+        return self._conn.cursor()
+
+
+class PositionWriter(_PgWriter):
+    def __init__(self):
+        super().__init__(UPSERT_POSITION_SQL)
+
+    def __call__(self, pos):
+        with self._cursor() as cur:
+            cur.execute(self._sql, (
+                pos["currency"], pos["settlement_account"],
+                pos["available_balance"], pos["total_inbound"],
+                pos["total_outbound"], pos["payment_count"],
+                pos["last_payment_id"], pos["event_time"],
+            ))
+        return f"[pos] {pos['currency']}:{pos['settlement_account']} bal={pos['available_balance']:.0f}"
+
+
+class FlowSummaryWriter(_PgWriter):
+    def __init__(self):
+        super().__init__(UPSERT_FLOW_SUMMARY_SQL)
+
+    def __call__(self, s):
+        with self._cursor() as cur:
+            cur.execute(self._sql, (
+                s["window_start"], s["window_end"],
+                s["currency"], s["settlement_account"],
+                s["net_flow"], s["total_inbound"],
+                s["total_outbound"], s["payment_count"],
+            ))
+        return f"[flow] {s['currency']}:{s['settlement_account']} net={s['net_flow']:.0f}"
+
+
+class AlertWriter(_PgWriter):
+    def __init__(self):
+        super().__init__(INSERT_ALERT_SQL)
+
+    def __call__(self, a):
+        with self._cursor() as cur:
+            cur.execute(self._sql, (
+                a["alert_type"], a["currency"], a["settlement_account"],
+                a["available_balance"], a["threshold_value"],
+                a["breach_amount"], a["triggered_at"], a["payment_id"],
+            ))
+        return f"[alert] {a['alert_type']} {a['currency']}:{a['settlement_account']}"
+
+
+# ─────────────────────────────────────────────────────────────────
 #  MAIN — Wires everything together into a Flink pipeline
 # ─────────────────────────────────────────────────────────────────
 def main():
     # Create the Flink streaming environment — this is the entry point for all Flink jobs
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)   # continuous real-time processing (not batch)
-    env.set_parallelism(16)    # run 16 parallel instances — one per Kafka partition
+    env.set_parallelism(1)     # parallelism 1 fits within a single TaskManager's 16 slots
 
     # ── Build Kafka source: reads from payments.all ────────────────
     # payments.all has 16 partitions (created in create_topics.sh)
@@ -634,7 +712,7 @@ def main():
         .set_topics("payments.all")                     # which topic to read
         .set_group_id("liquidity-position-engine")      # consumer group — Kafka tracks our offset
         .set_starting_offsets(KafkaOffsetsInitializer.committed_offsets(
-            KafkaOffsetsInitializer.earliest()          # on first run, start from beginning
+            KafkaOffsetResetStrategy.EARLIEST           # on first run, start from beginning
         ))                                              # on restart, resume from last committed offset
         .set_value_only_deserializer(SimpleStringSchema())  # read messages as plain strings
         .build()
@@ -657,13 +735,14 @@ def main():
     # Flink needs to know which field in each record is the "event time"
     # so it can track time progress and fire windows/timers correctly.
     # BoundedOutOfOrderness(1s) means: wait up to 1 second for late-arriving events
+    class PaymentTimestampAssigner(TimestampAssigner):
+        def extract_timestamp(self, value, record_timestamp):
+            return value.get("event_time_ms", 0) if isinstance(value, dict) else 0
+
     watermark_strategy = (
         WatermarkStrategy
         .for_bounded_out_of_orderness(Duration.of_seconds(1))   # tolerate 1s of out-of-order events
-        .with_timestamp_assigner(
-            lambda event, _: event.get("event_time_ms", 0) if isinstance(event, dict) else 0
-            # ^ this lambda tells Flink: "the event time is the event_time_ms field"
-        )
+        .with_timestamp_assigner(PaymentTimestampAssigner())     # extract event_time_ms as event time
     )
 
     # ── Create the raw payment stream from Kafka ───────────────────
@@ -792,85 +871,19 @@ def main():
         .aggregate(FlowAggregateFunction(), FlowWindowFunction())          # aggregate then format
     )
 
-    # ── PostgreSQL JDBC sinks ──────────────────────────────────────
-    from pyflink.datastream.connectors.jdbc import JdbcSink, JdbcConnectionOptions, JdbcExecutionOptions
-
-    # Connection config — tells JDBC how to connect to PostgreSQL
-    jdbc_options = (
-        JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-        .with_url(PG_URL)                              # jdbc:postgresql://postgres:5432/liquidity
-        .with_driver_name("org.postgresql.Driver")     # PostgreSQL JDBC driver class
-        .with_user_name(PG_USER)
-        .with_password(PG_PASS)
-        .build()
-    )
-
-    # Execution config — controls batching behaviour
-    exec_options = (
-        JdbcExecutionOptions.builder()
-        .with_batch_interval_ms(1000)   # flush accumulated records to DB every 1 second
-        .with_batch_size(200)           # or flush when 200 records are buffered, whichever first
-        .with_max_retries(3)            # retry failed DB writes up to 3 times
-        .build()
-    )
+    # ── PostgreSQL sinks (psycopg2 map-side-effect pattern) ──────
+    # Each writer writes to DB as a side effect and returns a log string.
+    # .print() acts as the terminal sink (output goes to TaskManager logs).
 
     # Sink 1: liquidity_positions — one upsert per payment
-    # The lambda maps field positions to the ? placeholders in UPSERT_POSITION_SQL
-    positions.map(json.dumps).add_sink(
-        JdbcSink.sink(
-            UPSERT_POSITION_SQL,
-            lambda stmt, pos: (
-                stmt.set_string(1, pos["currency"]),             # ? 1 = currency
-                stmt.set_string(2, pos["settlement_account"]),   # ? 2 = account
-                stmt.set_double(3, pos["available_balance"]),    # ? 3 = balance
-                stmt.set_double(4, pos["total_inbound"]),        # ? 4
-                stmt.set_double(5, pos["total_outbound"]),       # ? 5
-                stmt.set_int(6,    pos["payment_count"]),        # ? 6
-                stmt.set_string(7, pos["last_payment_id"]),      # ? 7
-                stmt.set_string(8, pos["event_time"]),           # ? 8
-            ),
-            jdbc_options,
-            exec_options,
-        )
-    )
+    positions.map(PositionWriter()).print()
 
     # Sink 2: liquidity_flow_summary — one upsert per 5-min window
-    flow_summary_stream.map(json.loads).add_sink(
-        JdbcSink.sink(
-            UPSERT_FLOW_SUMMARY_SQL,
-            lambda stmt, s: (
-                stmt.set_string(1, s["window_start"]),           # ? 1 = window start timestamp
-                stmt.set_string(2, s["window_end"]),             # ? 2 = window end timestamp
-                stmt.set_string(3, s["currency"]),               # ? 3
-                stmt.set_string(4, s["settlement_account"]),     # ? 4
-                stmt.set_double(5, s["net_flow"]),               # ? 5 (positive=inflow, negative=outflow)
-                stmt.set_double(6, s["total_inbound"]),          # ? 6
-                stmt.set_double(7, s["total_outbound"]),         # ? 7
-                stmt.set_int(8,    s["payment_count"]),          # ? 8
-            ),
-            jdbc_options,
-            exec_options,
-        )
-    )
+    # flow_summary_stream emits JSON strings; parse to dict before writing
+    flow_summary_stream.map(json.loads).map(FlowSummaryWriter()).print()
 
     # Sink 3: alert_log — audit trail for every threshold breach
-    alerts.add_sink(
-        JdbcSink.sink(
-            INSERT_ALERT_SQL,
-            lambda stmt, a: (
-                stmt.set_string(1, a["alert_type"]),             # ? 1 = "WARNING" or "CRITICAL"
-                stmt.set_string(2, a["currency"]),               # ? 2
-                stmt.set_string(3, a["settlement_account"]),     # ? 3
-                stmt.set_double(4, a["available_balance"]),      # ? 4 = balance at time of breach
-                stmt.set_double(5, a["threshold_value"]),        # ? 5 = threshold that was crossed
-                stmt.set_double(6, a["breach_amount"]),          # ? 6 = how much below threshold
-                stmt.set_string(7, a["triggered_at"]),           # ? 7 = ISO timestamp
-                stmt.set_string(8, a["payment_id"]),             # ? 8 = which payment caused it
-            ),
-            jdbc_options,
-            exec_options,
-        )
-    )
+    alerts.map(AlertWriter()).print()
 
     # ── Dead Letter Queue (DLQ) Kafka sink ────────────────────────
     # payments.dlq receives every message that failed parse_payment().

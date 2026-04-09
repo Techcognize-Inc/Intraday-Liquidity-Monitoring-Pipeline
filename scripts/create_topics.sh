@@ -14,7 +14,9 @@
 #    ops.feed.health      — Feed stale/recover alerts    (4 partitions)
 # ─────────────────────────────────────────────────────────────────
 
-set -euo pipefail
+# -u: error on unset vars, -o pipefail: catch pipe failures
+# NOTE: no -e flag — we handle errors manually with retries
+set -uo pipefail
 
 BOOTSTRAP="kafka:9092"
 REPLICATION=1          # single-broker dev cluster
@@ -22,11 +24,12 @@ RETENTION_MS=86400000  # 24 hours for payment events
 ALERT_RETENTION_MS=604800000  # 7 days for alert topics
 
 echo "Waiting for Kafka to be ready..."
-until kafka-topics --bootstrap-server "$BOOTSTRAP" --list &>/dev/null; do
+until kafka-topics --bootstrap-server "$BOOTSTRAP" --list > /dev/null 2>&1; do
     echo "  Kafka not ready yet, retrying in 3s..."
     sleep 3
 done
-echo "Kafka is ready."
+echo "Kafka is ready. Waiting 10s for controller election..."
+sleep 10
 
 create_topic() {
     local topic=$1
@@ -34,26 +37,36 @@ create_topic() {
     local retention_ms=$3
     local cleanup_policy=${4:-delete}
 
-    if kafka-topics --bootstrap-server "$BOOTSTRAP" --list | grep -q "^${topic}$"; then
-        echo "  [SKIP] Topic already exists: $topic"
-        return
-    fi
+    # Retry up to 5 times to handle transient broker errors
+    for attempt in 1 2 3 4 5; do
+        # Skip if topic already exists
+        if kafka-topics --bootstrap-server "$BOOTSTRAP" --list 2>/dev/null | grep -qF "$topic"; then
+            echo "  [SKIP] Topic already exists: $topic"
+            return 0
+        fi
 
-    kafka-topics \
-        --bootstrap-server "$BOOTSTRAP" \
-        --create \
-        --topic "$topic" \
-        --partitions "$partitions" \
-        --replication-factor "$REPLICATION" \
-        --config retention.ms="$retention_ms" \
-        --config cleanup.policy="$cleanup_policy"
+        if kafka-topics \
+            --bootstrap-server "$BOOTSTRAP" \
+            --create \
+            --topic "$topic" \
+            --partitions "$partitions" \
+            --replication-factor "$REPLICATION" \
+            --config retention.ms="$retention_ms" \
+            --config cleanup.policy="$cleanup_policy" 2>/dev/null; then
+            echo "  [OK]   Created: $topic (partitions=$partitions, retention=${retention_ms}ms, cleanup=$cleanup_policy)"
+            return 0
+        fi
 
-    echo "  [OK]   Created: $topic (partitions=$partitions, retention=${retention_ms}ms, cleanup=$cleanup_policy)"
+        echo "  Attempt $attempt failed for '$topic', retrying in 5s..."
+        sleep 5
+    done
+
+    echo "  [FAIL] Could not create topic after 5 attempts: $topic" >&2
+    return 1
 }
 
 echo ""
 echo "Creating payment topics..."
-# 16 partitions to match LiquidityPositionEngine parallelism=16
 create_topic "payments.rtgs"       16 "$RETENTION_MS"
 create_topic "payments.chaps"      16 "$RETENTION_MS"
 create_topic "payments.internal"   16 "$RETENTION_MS"
@@ -66,7 +79,6 @@ create_topic "liquidity.critical"  4  "$ALERT_RETENTION_MS"
 
 echo ""
 echo "Creating threshold topic (compacted — enables ThresholdManager replay on restart)..."
-# 1 partition + compacted: ThresholdManager can replay full threshold state on job restart
 create_topic "liquidity.thresholds" 1 "$ALERT_RETENTION_MS" "compact"
 
 echo ""
@@ -75,9 +87,6 @@ create_topic "ops.feed.health"     4  "$ALERT_RETENTION_MS"
 
 echo ""
 echo "Creating Dead Letter Queue topic..."
-# payments.dlq receives messages rejected by parse_payment() in LiquidityPositionEngine.
-# 7-day retention gives ops time to inspect failures, fix the upstream producer,
-# and republish corrected messages to payments.all for reprocessing.
 create_topic "payments.dlq"        4  "$ALERT_RETENTION_MS"
 
 echo ""

@@ -20,39 +20,39 @@
 # flink:1.18.1        = Flink version 1.18.1
 # scala_2.12          = compiled with Scala 2.12 (needed by Kafka connector)
 # java11              = runs on Java 11 JVM
-FROM flink:1.18.1-scala_2.12-java11
+FROM flink:1.19.1-scala_2.12-java11
 
 # ── Build arguments (ARG = build-time variable, can be overridden with --build-arg) ──
-ARG FLINK_VERSION=1.18.1           # must match the base image version
-ARG SCALA_VERSION=2.12             # must match base image Scala version
-ARG KAFKA_CONNECTOR_VERSION=3.1.0-1.18   # Kafka SQL connector version for Flink 1.18
-ARG JDBC_CONNECTOR_VERSION=3.1.2-1.18    # JDBC connector version for Flink 1.18
-ARG PG_JDBC_VERSION=42.7.3               # PostgreSQL JDBC driver version
-ARG PYFLINK_VERSION=1.18.1               # PyFlink version — must match Flink base image
+ARG FLINK_VERSION=1.19.1
+ARG SCALA_VERSION=2.12
+ARG KAFKA_CONNECTOR_VERSION=3.2.0-1.19
+ARG JDBC_CONNECTOR_VERSION=3.2.0-1.19
+ARG PG_JDBC_VERSION=42.7.3
+ARG PYFLINK_VERSION=1.19.0
 
 # ── System packages ───────────────────────────────────────────────
 # Install Python 3.11 and tools needed to run PyFlink jobs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 \           # Python 3.11 runtime
-        python3.11-dev \       # Python headers (needed to compile some pip packages)
-        python3-pip \          # pip package manager
-        python3.11-venv \      # virtual environment support
-        curl \                 # for health checks and downloading
-        wget \                 # for downloading JAR files below
-        procps \               # for process management (ps command)
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \   # make python3 point to 3.11
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \    # make python point to 3.11
-    && apt-get clean \                                  # remove apt cache to reduce image size
-    && rm -rf /var/lib/apt/lists/*                      # delete downloaded package lists
+        python3.11 \
+        python3.11-dev \
+        python3-pip \
+        python3.11-venv \
+        curl \
+        wget \
+        procps \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # ── Python packages ───────────────────────────────────────────────
 # Install the Python libraries our Flink jobs need
-RUN pip3 install --no-cache-dir \          # --no-cache-dir keeps image smaller
-    apache-flink==${PYFLINK_VERSION} \     # PyFlink — the Python API for Apache Flink
-    psycopg2-binary==2.9.9 \              # PostgreSQL driver (binary = no compilation needed)
-    kafka-python==2.0.2 \                 # Python Kafka client (used in some utility scripts)
-    prometheus-client==0.20.0 \           # Prometheus metrics client
-    python-dateutil==2.9.0                # date parsing utilities
+RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
+    apache-flink==${PYFLINK_VERSION} \
+    psycopg2-binary==2.9.9 \
+    kafka-python==2.0.2 \
+    prometheus-client==0.20.0 \
+    python-dateutil==2.9.0
 
 # ── Flink connector JARs ──────────────────────────────────────────
 # JARs go in /opt/flink/lib/ — Flink's classloader automatically

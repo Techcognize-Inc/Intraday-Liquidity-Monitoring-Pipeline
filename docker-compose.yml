@@ -1,5 +1,3 @@
-version: "3.8" # docker-compose file format version
-
 # ─────────────────────────────────────────────────────────────────
 #  Intraday Liquidity Monitoring Pipeline — docker-compose.yml
 #
@@ -77,17 +75,18 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181 # port clients (Kafka) connect to
       ZOOKEEPER_TICK_TIME: 2000 # basic time unit (ms) for heartbeats and timeouts
       ZOOKEEPER_SYNC_LIMIT: 2 # max ticks a follower can be behind the leader
+      ZOOKEEPER_MAX_SESSION_TIMEOUT: "120000" # allow Kafka to use up to 120s session timeout
     ports:
       - "2181:2181" # expose to host so you can inspect Zookeeper from your machine
     volumes:
       - zookeeper-data:/var/lib/zookeeper/data # persist Zookeeper data across container restarts
       - zookeeper-log:/var/lib/zookeeper/log # persist transaction logs
     healthcheck:
-      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
-      # "ruok" = "are you ok?" — Zookeeper responds "imok" if healthy
-      interval: 10s # check every 10 seconds
-      timeout: 5s # fail if no response within 5 seconds
-      retries: 5 # mark unhealthy after 5 consecutive failures
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "30"]
+      interval: 10s
+      timeout: 35s
+      retries: 10
+      start_period: 30s
     networks:
       - liquidity-net
 
@@ -102,13 +101,15 @@ services:
     container_name: kafka
     depends_on:
       zookeeper:
-        condition: service_healthy # Kafka cannot start without a healthy Zookeeper
+        condition: service_healthy # wait for cub zk-ready to confirm ZooKeeper is accepting connections
     ports:
       - "9092:9092" # INTERNAL port — used by other containers (Flink, producer)
       - "9093:9093" # EXTERNAL port — used when connecting from your host machine (e.g. kafka-ui)
     environment:
       KAFKA_BROKER_ID: 1 # unique broker ID (we have 1 broker)
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181 # Zookeeper address
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: "60000" # 60s — prevents session expiry during slow startup
+      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: "60000" # 60s connection timeout
       KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
       # 0.0.0.0 = listen on all network interfaces for both listeners
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9093
@@ -125,6 +126,7 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # don't auto-create topics — kafka-init creates them explicitly
     volumes:
       - kafka-data:/var/lib/kafka/data # persist Kafka log data across restarts
+    restart: on-failure:3
     healthcheck:
       test:
         [
@@ -135,8 +137,9 @@ services:
         ]
       # checks if the broker is responding to API calls
       interval: 15s
-      timeout: 10s
-      retries: 8 # more retries because Kafka takes longer to start than Zookeeper
+      timeout: 30s
+      retries: 10
+      start_period: 90s # give Kafka 90s to fully initialize before health checks begin
     networks:
       - liquidity-net
 
@@ -162,7 +165,8 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"] # /subjects returns list of schemas
       interval: 15s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 30s
     networks:
       - liquidity-net
 
@@ -235,10 +239,9 @@ services:
     container_name: flink-jobmanager
     command: jobmanager # tell the Flink entrypoint to start in JobManager mode
     ports:
-      - "8080:8081" # Flink Web UI (host:8080 → container:8081)
+      - "18080:8081" # Flink Web UI (host:18080 → container:8081)
       - "9249:9249" # Prometheus metrics endpoint
     environment:
-      <<: *flink-common # merge with the anchor's environment
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.memory.process.size: 1600m   # 1.6GB for the JobManager process
@@ -281,7 +284,6 @@ services:
       flink-jobmanager:
         condition: service_started # JobManager must be up first
     environment:
-      <<: *flink-common
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.memory.process.size: 4096m      # 4GB — larger because TM holds RocksDB state
@@ -380,14 +382,14 @@ services:
     image: grafana/grafana:10.4.0 # official Grafana image
     container_name: grafana
     ports:
-      - "3000:3000" # Grafana web UI (http://localhost:3000)
+      - "13000:3000" # Grafana web UI (http://localhost:13000)
     environment:
       GF_SECURITY_ADMIN_USER: admin # default admin username
       GF_SECURITY_ADMIN_PASSWORD: admin # default admin password (change in production!)
       GF_AUTH_ANONYMOUS_ENABLED: "true" # allow viewing dashboard without login
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer # anonymous users get view-only access
       GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 5s # allow dashboards to refresh as fast as every 5s
-      GF_DATABASE_TYPE: postgres # Grafana's own internal database (not our liquidity DB)
+      # Grafana uses SQLite by default for its internal DB — no external DB needed
       POSTGRES_HOST: postgres # passed to datasources.yml via provisioning
       POSTGRES_PORT: "5432"
       POSTGRES_DB: liquidity
