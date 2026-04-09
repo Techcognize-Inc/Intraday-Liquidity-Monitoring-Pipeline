@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────
 #  Intraday Liquidity Monitoring Pipeline — docker-compose.yml
 #
-#  This file defines ALL 10 services that make up the pipeline.
+#  This file defines ALL 11 services that make up the pipeline.
 #  Run with: docker-compose up -d
 #
 #  Services:
@@ -12,6 +12,7 @@
 #    postgres        — Stores positions, thresholds, alerts, pending payments
 #    flink-jobmanager — Flink master: schedules and monitors jobs
 #    flink-taskmanager — Flink worker: executes the jobs (parallelism=16)
+#    flink-init      — One-shot: submits PaymentStreamMerger + LiquidityPositionEngine, then exits
 #    payment-producer — Generates fake payment events and publishes to Kafka
 #    prometheus      — Collects metrics from Flink
 #    grafana         — Displays the live dashboard
@@ -316,6 +317,29 @@ services:
     ports:
       - "9250:9249" # TM Prometheus metrics mapped to 9250 on host (9249 already used by JM)
     restart: unless-stopped # restart automatically if the TM crashes
+
+  # ──────────────────────────────────────────────────────────────
+  #  FLINK JOB SUBMITTER
+  #  Runs start_flink_cluster.sh ONCE to submit both Flink jobs,
+  #  then exits. Same pattern as kafka-init.
+  #  Waits for Flink REST API to be ready before submitting.
+  # ──────────────────────────────────────────────────────────────
+  flink-init:
+    <<: *flink-common
+    container_name: flink-init
+    depends_on:
+      flink-taskmanager:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/start_flink_cluster.sh"]
+    volumes:
+      - ./scripts/start_flink_cluster.sh:/scripts/start_flink_cluster.sh:ro
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
+    restart: "no"
 
   # ──────────────────────────────────────────────────────────────
   #  PAYMENT PRODUCER
