@@ -176,6 +176,7 @@ def validate_payment(record: dict) -> str | None:
     # 6. Amount must be within the expected range for this rail
     # Anything outside is almost certainly a producer bug, not a real payment.
     # Note: amount is already validated as a positive float by check 5 above.
+    rail = record["rail"]
     if rail in AMOUNT_RANGES:
         lo, hi = AMOUNT_RANGES[rail]
         if not (lo <= amount <= hi):

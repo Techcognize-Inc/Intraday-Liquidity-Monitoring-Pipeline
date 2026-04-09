@@ -44,7 +44,6 @@ import os
 
 from pyflink.common import WatermarkStrategy, Duration
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common.typeinfo import Types
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
@@ -156,26 +155,18 @@ def build_pipeline(env: StreamExecutionEnvironment) -> None:
     # which is fine — LiquidityPositionEngine uses event time, not arrival order.
     merged = rail_streams[0].union(*rail_streams[1:])
 
-    # ── Step 3: attach partition key for the sink ──────────────────
-    # We derive the key here so the KafkaSink can use it as the Kafka
-    # message key. The map produces (key_or_None, raw_json) tuples.
-    keyed = merged.map(
-        lambda raw: (extract_partition_key(raw), raw),
-        output_type=Types.TUPLE([Types.STRING(), Types.STRING()]),
-    ).name("ExtractPartitionKey")
-
-    # ── Step 4: KafkaSink → payments.all ──────────────────────────
-    # KafkaRecordSerializationSchema lets us set both the key and value.
-    # Key  → currency:settlement_account  (routes to consistent partition)
-    # Value → raw JSON string (unchanged — no transformation in the merger)
+    # ── Step 3: KafkaSink → payments.all ──────────────────────────
+    # Sink the raw JSON string directly. LiquidityPositionEngine applies
+    # its own key_by after reading from payments.all, so no partition key
+    # is needed here. Using value-only serialization avoids the Tuple2
+    # cast error that occurs with set_key_serialization_schema.
     sink = (
         KafkaSink.builder()
         .set_bootstrap_servers(KAFKA_SERVERS)
         .set_record_serializer(
             KafkaRecordSerializationSchema.builder()
             .set_topic(OUTPUT_TOPIC)
-            .set_key_serialization_schema(SimpleStringSchema())      # tuple[0] → key
-            .set_value_serialization_schema(SimpleStringSchema())    # tuple[1] → value
+            .set_value_serialization_schema(SimpleStringSchema())
             .build()
         )
         # AT_LEAST_ONCE: if the job restarts before a checkpoint, some messages
@@ -188,7 +179,7 @@ def build_pipeline(env: StreamExecutionEnvironment) -> None:
         .build()
     )
 
-    keyed.sink_to(sink).name(f"KafkaSink-{OUTPUT_TOPIC}")
+    merged.sink_to(sink).name(f"KafkaSink-{OUTPUT_TOPIC}")
     logger.info(f"Sink registered: {OUTPUT_TOPIC}")
 
 
