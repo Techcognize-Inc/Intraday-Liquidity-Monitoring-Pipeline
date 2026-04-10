@@ -63,6 +63,7 @@ print(len([j for j in jobs if j.get('name') == '${job_name}' and j.get('state') 
     fi
 
     flink run \
+        --detached \
         --python "${JOBS_DIR}/${job_file}" \
         2>&1 | tail -3
 

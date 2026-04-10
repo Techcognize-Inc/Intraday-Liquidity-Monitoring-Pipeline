@@ -10,26 +10,7 @@ Modules:
                                to all LiquidityPositionEngine instances (parallelism=1)
 """
 
-from flink_jobs.liquidity_position_engine import (
-    LiquidityPositionFunction,
-    FlowAggregateFunction,
-    FlowWindowFunction,
-    FlowAccumulator,
-    parse_payment,
-    validate_payment,
-)
-from flink_jobs.threshold_manager import (
-    ThresholdBroadcastFunction,
-)
-
-__all__ = [
-    # liquidity_position_engine
-    "LiquidityPositionFunction",
-    "FlowAggregateFunction",
-    "FlowWindowFunction",
-    "FlowAccumulator",
-    "parse_payment",
-    "validate_payment",
-    # threshold_manager
-    "ThresholdBroadcastFunction",
-]
+# Imports are intentionally omitted here so that pyflink (only available
+# inside Docker) is not loaded at package import time, allowing pytest to
+# collect and run unit tests in a local Python environment.
+# Individual modules are imported directly in test files and production code.

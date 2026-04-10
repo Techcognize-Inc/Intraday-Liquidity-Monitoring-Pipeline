@@ -2,7 +2,7 @@
 Tests: Liquidity Position Engine
 ==================================
 Covers the core balance maths and alert logic inside
-LiquidityPositionFunction (KeyedProcessFunction).
+LiquidityPositionFunction (KeyedBroadcastProcessFunction).
 
 These tests do NOT need a running Flink cluster.
 We instantiate LiquidityPositionFunction directly and drive it
@@ -23,6 +23,7 @@ Key scenarios:
 
 import json
 import unittest
+import uuid
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -52,6 +53,21 @@ class MockValueState:
         self._value = v
 
 
+class MockMapState:
+    """Mimics Flink MapState — dict of key→value, supports .contains() and .put()."""
+    def __init__(self):
+        self._data = {}
+
+    def contains(self, key):
+        return key in self._data
+
+    def put(self, key, value):
+        self._data[key] = value
+
+    def get(self, key):
+        return self._data.get(key)
+
+
 class MockBroadcastState:
     """Mimics Flink BroadcastState — stores a dict keyed by string."""
     def __init__(self, data=None):
@@ -65,9 +81,10 @@ class MockBroadcastState:
 
 
 class MockRuntimeContext:
-    """Returns MockValueState for each descriptor name."""
+    """Returns MockValueState/MockMapState for each descriptor name."""
     def __init__(self, thresholds=None):
         self._states = {}
+        self._map_states = {}
         self._broadcast = MockBroadcastState(thresholds or {})
 
     def get_state(self, descriptor):
@@ -76,29 +93,49 @@ class MockRuntimeContext:
             self._states[name] = MockValueState()
         return self._states[name]
 
+    def get_map_state(self, descriptor):
+        """Required by engine for seen_payments duplicate-detection state."""
+        name = descriptor.name
+        if name not in self._map_states:
+            self._map_states[name] = MockMapState()
+        return self._map_states[name]
+
     def get_broadcast_state(self, descriptor):
         return self._broadcast
 
 
 class MockContext:
-    """Mimics KeyedProcessFunction.Context — captures timer registrations."""
-    def __init__(self, key="GBP:RTGS-GBP-001"):
+    """
+    Mimics KeyedBroadcastProcessFunction.ReadOnlyContext.
+    Captures processing-time timer registrations and provides broadcast state.
+
+    Note: engine calls ctx.timer_service() (as a callable), which returns
+    timer_service.return_value — so mocks are set on .return_value.
+    """
+    def __init__(self, key="GBP:RTGS-GBP-001", broadcast_state=None):
         self._key = key
         self._timers = []
+        self._broadcast = broadcast_state or MockBroadcastState()
         self.timer_service = MagicMock()
-        self.timer_service.register_event_time_timer.side_effect = self._timers.append
-        self.timer_service.delete_event_time_timer = MagicMock()
+        # Engine calls: ctx.timer_service().register_processing_time_timer(ts)
+        self.timer_service.return_value.register_processing_time_timer.side_effect = self._timers.append
+        self.timer_service.return_value.delete_processing_time_timer = MagicMock()
 
     def get_current_key(self):
         return self._key
+
+    def get_broadcast_state(self, descriptor):
+        return self._broadcast
 
 
 def make_payment(currency="GBP", account="RTGS-GBP-001",
                  amount=1_000_000.0, direction="DEBIT",
                  rail="RTGS", payment_id=None):
-    """Build a minimal parsed payment dict (output of parse_payment)."""
+    """Build a minimal parsed payment dict (output of parse_payment).
+    Uses a unique UUID by default so duplicate detection doesn't fire.
+    """
     return {
-        "payment_id":         payment_id or "test-payment-001",
+        "payment_id":         payment_id or str(uuid.uuid4()),
         "currency":           currency,
         "settlement_account": account,
         "amount":             amount,
@@ -113,17 +150,19 @@ def make_payment(currency="GBP", account="RTGS-GBP-001",
 def drive_function(payments, thresholds=None):
     """
     Run a sequence of payments through LiquidityPositionFunction.
-    Returns list of (type, record) tuples collected from out.
+    Returns list of (type, record) tuples collected from the generator.
     """
     func = LiquidityPositionFunction()
-    ctx  = MockRuntimeContext(thresholds=thresholds)
-    func.open(ctx)
+    runtime_ctx = MockRuntimeContext(thresholds=thresholds)
+    func.open(runtime_ctx)
 
     collected = []
-    mock_ctx  = MockContext()
+    # Pass broadcast state to MockContext so process_element can read thresholds
+    mock_ctx = MockContext(broadcast_state=runtime_ctx._broadcast)
 
     for payment in payments:
-        func.process_element(payment, mock_ctx, collected)
+        # process_element uses yield — must consume the generator to execute it
+        collected.extend(func.process_element(payment, mock_ctx))
 
     return collected, mock_ctx
 
@@ -135,11 +174,14 @@ def drive_function(payments, thresholds=None):
 class TestParsePayment(unittest.TestCase):
 
     def _valid_raw(self, **overrides):
+        """Build a valid RTGS payment JSON string.
+        Amount £15M is within the RTGS range (£10M–£500M).
+        """
         data = {
             "payment_id":         "abc-123",
             "currency":           "GBP",
             "settlement_account": "RTGS-GBP-001",
-            "amount":             5_000_000.0,
+            "amount":             15_000_000.0,   # £15M — valid for RTGS
             "direction":          "DEBIT",
             "rail":               "RTGS",
             "counterparty":       "HSBC",
@@ -149,33 +191,41 @@ class TestParsePayment(unittest.TestCase):
         return json.dumps(data)
 
     def test_valid_payment_parsed_correctly(self):
-        result = parse_payment(self._valid_raw())
-        self.assertIsNotNone(result)
-        self.assertEqual(result["currency"], "GBP")
-        self.assertEqual(result["amount"], 5_000_000.0)
+        """A valid payment returns ("ok", record) with the correct fields."""
+        tag, record = parse_payment(self._valid_raw())
+        self.assertEqual(tag, "ok")
+        self.assertEqual(record["currency"], "GBP")
+        self.assertEqual(record["amount"], 15_000_000.0)
 
     def test_event_time_ms_added(self):
         """parse_payment must add event_time_ms (epoch-ms) to the dict."""
-        result = parse_payment(self._valid_raw())
-        self.assertIn("event_time_ms", result)
-        self.assertIsInstance(result["event_time_ms"], int)
+        tag, record = parse_payment(self._valid_raw())
+        self.assertEqual(tag, "ok")
+        self.assertIn("event_time_ms", record)
+        self.assertIsInstance(record["event_time_ms"], int)
         # 2026-04-01T09:15:00Z → known epoch value
         expected_ms = int(datetime(2026, 4, 1, 9, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        self.assertEqual(result["event_time_ms"], expected_ms)
+        self.assertEqual(record["event_time_ms"], expected_ms)
 
-    def test_malformed_json_returns_none(self):
-        result = parse_payment("not valid json {{")
-        self.assertIsNone(result)
+    def test_malformed_json_routed_to_dlq(self):
+        """Malformed JSON returns ("dlq", error_record)."""
+        tag, error = parse_payment("not valid json {{")
+        self.assertEqual(tag, "dlq")
+        self.assertEqual(error["stage"], "json_parse")
 
-    def test_missing_event_time_returns_none(self):
+    def test_missing_event_time_routed_to_dlq(self):
+        """Payment missing event_time returns ("dlq", error_record)."""
         data = json.loads(self._valid_raw())
         del data["event_time"]
-        result = parse_payment(json.dumps(data))
-        self.assertIsNone(result)
+        tag, error = parse_payment(json.dumps(data))
+        self.assertEqual(tag, "dlq")
+        self.assertEqual(error["stage"], "schema_validation")
 
-    def test_empty_string_returns_none(self):
-        result = parse_payment("")
-        self.assertIsNone(result)
+    def test_empty_string_routed_to_dlq(self):
+        """Empty string returns ("dlq", error_record)."""
+        tag, error = parse_payment("")
+        self.assertEqual(tag, "dlq")
+        self.assertEqual(error["stage"], "json_parse")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -195,7 +245,6 @@ class TestBalanceArithmetic(unittest.TestCase):
 
     def test_debit_decreases_balance(self):
         """A DEBIT payment should decrease available balance."""
-        # Start with a credit to have a non-zero balance
         payments = [
             make_payment(amount=10_000_000.0, direction="CREDIT"),
             make_payment(amount=3_000_000.0,  direction="DEBIT"),
@@ -283,7 +332,6 @@ class TestThresholdAlerts(unittest.TestCase):
     def test_no_alert_when_balance_above_warning(self):
         """Balance comfortably above warning threshold → no alerts."""
         payments = [
-            # Credit £5B first so balance starts above warning
             make_payment(amount=5_000_000_000.0, direction="CREDIT"),
             make_payment(amount=100_000_000.0,   direction="DEBIT"),   # balance = £4.9B
         ]
@@ -370,28 +418,31 @@ class TestThresholdAlerts(unittest.TestCase):
 
 class TestTimerRegistration(unittest.TestCase):
 
-    def test_event_time_timer_registered_on_each_payment(self):
+    def test_processing_time_timer_registered_on_each_payment(self):
         """A stale-feed timer must be registered for every payment processed."""
         payments = [make_payment()]
         _, mock_ctx = drive_function(payments)
-        mock_ctx.timer_service.register_event_time_timer.assert_called_once()
+        mock_ctx.timer_service.return_value.register_processing_time_timer.assert_called_once()
 
-    def test_timer_set_60s_after_event_time(self):
-        """Timer should fire at event_time_ms + 60,000ms."""
+    @patch('flink_jobs.liquidity_position_engine.time')
+    def test_timer_set_60s_from_wall_clock(self, mock_time):
+        """Timer should fire 60,000ms from current wall-clock time (not event_time)."""
+        fake_now_s = 1743498000.0   # fake wall-clock in seconds
+        mock_time.time.return_value = fake_now_s
+
         payment = make_payment()
-        event_ms = payment["event_time_ms"]
-
         _, mock_ctx = drive_function([payment])
 
-        registered_ts = mock_ctx.timer_service.register_event_time_timer.call_args[0][0]
-        self.assertEqual(registered_ts, event_ms + 60_000)
+        registered_ts = mock_ctx.timer_service.return_value.register_processing_time_timer.call_args[0][0]
+        expected_ts = int(fake_now_s * 1000) + 60_000
+        self.assertEqual(registered_ts, expected_ts)
 
     def test_previous_timer_deleted_before_new_registration(self):
         """Each payment must cancel the previous timer before registering a new one."""
         payments = [make_payment(), make_payment()]
         _, mock_ctx = drive_function(payments)
-        # delete_event_time_timer should be called once (after first timer is set)
-        mock_ctx.timer_service.delete_event_time_timer.assert_called_once()
+        # delete should be called once (second payment cancels first timer)
+        mock_ctx.timer_service.return_value.delete_processing_time_timer.assert_called_once()
 
 
 if __name__ == "__main__":

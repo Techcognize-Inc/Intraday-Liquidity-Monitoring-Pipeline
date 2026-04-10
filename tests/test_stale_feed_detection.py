@@ -18,7 +18,7 @@ We call on_timer() directly on the LiquidityPositionFunction instance.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import sys
 import os
@@ -56,13 +56,14 @@ class MockOnTimerContext:
 def make_function_with_payments(payments, thresholds=None):
     """Helper: open a LiquidityPositionFunction and drive it with payments."""
     func = LiquidityPositionFunction()
-    ctx  = MockRuntimeContext(thresholds=thresholds or {})
-    func.open(ctx)
+    runtime_ctx = MockRuntimeContext(thresholds=thresholds or {})
+    func.open(runtime_ctx)
 
     collected = []
-    mock_ctx  = MockContext()
+    mock_ctx = MockContext(broadcast_state=runtime_ctx._broadcast)
     for payment in payments:
-        func.process_element(payment, mock_ctx, collected)
+        # process_element uses yield — consume the generator
+        collected.extend(func.process_element(payment, mock_ctx))
 
     return func, collected, mock_ctx
 
@@ -76,11 +77,11 @@ class TestOnTimerFiresStaleAlert(unittest.TestCase):
         """
         func, _, _ = make_function_with_payments([make_payment()])
 
-        collected_from_timer = []
-        timer_ts = 1743498060000   # arbitrary timestamp
+        timer_ts = 1743498060000
         timer_ctx = MockOnTimerContext("GBP:RTGS-GBP-001")
 
-        func.on_timer(timer_ts, timer_ctx, collected_from_timer)
+        # on_timer uses yield — consume the generator
+        collected_from_timer = list(func.on_timer(timer_ts, timer_ctx))
 
         feed_health_events = [r for t, r in collected_from_timer if t == "feed_health"]
         self.assertEqual(len(feed_health_events), 1,
@@ -89,8 +90,8 @@ class TestOnTimerFiresStaleAlert(unittest.TestCase):
     def test_stale_event_type_is_feed_stale(self):
         """The emitted record must have type='feed_stale'."""
         func, _, _ = make_function_with_payments([make_payment()])
-        collected = []
-        func.on_timer(1743498060000, MockOnTimerContext(), collected)
+
+        collected = list(func.on_timer(1743498060000, MockOnTimerContext()))
 
         feed_event = [r for t, r in collected if t == "feed_health"][0]
         self.assertEqual(feed_event["type"], "feed_stale")
@@ -101,19 +102,13 @@ class TestOnTimerFiresStaleAlert(unittest.TestCase):
         This tells the dashboard exactly when the feed went silent.
         """
         func, _, _ = make_function_with_payments([make_payment()])
-        collected = []
-        timer_ts  = 1743498060000
-        func.on_timer(timer_ts, MockOnTimerContext(), collected)
+        timer_ts = 1743498060000
+
+        collected = list(func.on_timer(timer_ts, MockOnTimerContext()))
 
         feed_event = [r for t, r in collected if t == "feed_health"][0]
-        self.assertEqual(
-            feed_event["detected_at_ts"],
-            timer_ts,
-        )
-        self.assertEqual(
-            feed_event["stale_since_ts"],
-            timer_ts - STALE_FEED_TIMEOUT_MS,
-        )
+        self.assertEqual(feed_event["detected_at_ts"], timer_ts)
+        self.assertEqual(feed_event["stale_since_ts"], timer_ts - STALE_FEED_TIMEOUT_MS)
 
     def test_stale_event_contains_correct_key(self):
         """The key in the stale event must match the (currency:account) key."""
@@ -121,8 +116,8 @@ class TestOnTimerFiresStaleAlert(unittest.TestCase):
         func, _, _ = make_function_with_payments([
             make_payment(currency="EUR", account="NOSTRO-EUR-001")
         ])
-        collected = []
-        func.on_timer(1743498060000, MockOnTimerContext(key=key), collected)
+
+        collected = list(func.on_timer(1743498060000, MockOnTimerContext(key=key)))
 
         feed_event = [r for t, r in collected if t == "feed_health"][0]
         self.assertEqual(feed_event["key"], key)
@@ -130,8 +125,8 @@ class TestOnTimerFiresStaleAlert(unittest.TestCase):
     def test_on_timer_does_not_emit_position_or_alert(self):
         """on_timer() is for feed health only — must not emit positions or alerts."""
         func, _, _ = make_function_with_payments([make_payment()])
-        collected = []
-        func.on_timer(1743498060000, MockOnTimerContext(), collected)
+
+        collected = list(func.on_timer(1743498060000, MockOnTimerContext()))
 
         positions = [r for t, r in collected if t == "position"]
         alerts    = [r for t, r in collected if t == "alert"]
@@ -146,57 +141,65 @@ class TestTimerResetOnPaymentArrival(unittest.TestCase):
     """
 
     def test_first_payment_registers_timer(self):
-        """First payment must register one EventTimeTimer."""
+        """First payment must register one ProcessingTimeTimer."""
         _, _, mock_ctx = make_function_with_payments([make_payment()])
         self.assertEqual(
-            mock_ctx.timer_service.register_event_time_timer.call_count, 1
+            mock_ctx.timer_service.return_value.register_processing_time_timer.call_count, 1
         )
 
-    def test_second_payment_cancels_previous_timer(self):
+    @patch('flink_jobs.liquidity_position_engine.time')
+    def test_second_payment_cancels_previous_timer(self, mock_time):
         """
-        Second payment must call delete_event_time_timer with the
+        Second payment must call delete_processing_time_timer with the
         timestamp registered by the first payment.
         """
+        fake_now_1 = 1743498000.0
+        fake_now_2 = 1743498010.0  # 10s later
+        mock_time.time.side_effect = [fake_now_1, fake_now_2]
+
         payment1 = make_payment()
         payment2 = make_payment()
 
         func = LiquidityPositionFunction()
-        ctx  = MockRuntimeContext()
-        func.open(ctx)
+        runtime_ctx = MockRuntimeContext()
+        func.open(runtime_ctx)
 
-        collected = []
-        mock_ctx  = MockContext()
+        mock_ctx = MockContext(broadcast_state=runtime_ctx._broadcast)
 
-        func.process_element(payment1, mock_ctx, collected)
-        first_timer_ts = mock_ctx.timer_service.register_event_time_timer.call_args_list[0][0][0]
+        list(func.process_element(payment1, mock_ctx))
+        first_timer_ts = mock_ctx.timer_service.return_value.register_processing_time_timer.call_args_list[0][0][0]
 
-        func.process_element(payment2, mock_ctx, collected)
+        list(func.process_element(payment2, mock_ctx))
 
         # The first timer should have been deleted when second payment arrived
-        mock_ctx.timer_service.delete_event_time_timer.assert_called_with(first_timer_ts)
+        mock_ctx.timer_service.return_value.delete_processing_time_timer.assert_called_with(first_timer_ts)
 
-    def test_timer_extended_with_each_payment(self):
+    @patch('flink_jobs.liquidity_position_engine.time')
+    def test_timer_extended_with_each_payment(self, mock_time):
         """
-        Each payment schedules a new timer 60s from its own event_time.
+        Each payment schedules a new timer 60s from wall-clock time.
         This means as long as payments keep arriving, on_timer() never fires.
         """
+        fake_now_1 = 1743498000.0
+        fake_now_2 = 1743498010.0  # 10s later
+        mock_time.time.side_effect = [fake_now_1, fake_now_2]
+
         payment1 = make_payment()
-        payment2 = {**make_payment(), "event_time_ms": payment1["event_time_ms"] + 10_000}  # 10s later
+        payment2 = make_payment()
 
         func = LiquidityPositionFunction()
-        ctx  = MockRuntimeContext()
-        func.open(ctx)
+        runtime_ctx = MockRuntimeContext()
+        func.open(runtime_ctx)
 
-        collected = []
-        mock_ctx  = MockContext()
+        mock_ctx = MockContext(broadcast_state=runtime_ctx._broadcast)
 
-        func.process_element(payment1, mock_ctx, collected)
-        func.process_element(payment2, mock_ctx, collected)
+        list(func.process_element(payment1, mock_ctx))
+        list(func.process_element(payment2, mock_ctx))
 
-        # Second timer should be 60s after payment2's event_time
-        all_timer_registrations = mock_ctx.timer_service.register_event_time_timer.call_args_list
+        # Second timer should be 60s after payment2's wall-clock time
+        all_timer_registrations = mock_ctx.timer_service.return_value.register_processing_time_timer.call_args_list
         second_timer_ts = all_timer_registrations[1][0][0]
-        expected_ts = payment2["event_time_ms"] + STALE_FEED_TIMEOUT_MS
+        expected_ts = int(fake_now_2 * 1000) + STALE_FEED_TIMEOUT_MS
         self.assertEqual(second_timer_ts, expected_ts)
 
 

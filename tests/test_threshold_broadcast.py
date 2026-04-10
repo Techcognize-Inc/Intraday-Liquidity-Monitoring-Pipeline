@@ -52,6 +52,15 @@ def make_threshold_update(currency="GBP", account="RTGS-GBP-001",
     }
 
 
+class MockCollector:
+    """Mimics Flink Collector — accumulates records from out.collect()."""
+    def __init__(self):
+        self.items = []
+
+    def collect(self, item):
+        self.items.append(item)
+
+
 class MockBroadcastContext:
     """Mimics BroadcastProcessFunction.Context — wraps a MockBroadcastState."""
     def __init__(self, initial_state=None):
@@ -75,9 +84,9 @@ class TestThresholdBroadcastFunction(unittest.TestCase):
         """Run one threshold update through ThresholdBroadcastFunction."""
         func = ThresholdBroadcastFunction()
         ctx  = MockBroadcastContext(initial_state)
-        collected = []
-        func.process_broadcast_element(update_dict, ctx, collected)
-        return ctx.broadcast_state, collected
+        out  = MockCollector()
+        func.process_broadcast_element(update_dict, ctx, out)
+        return ctx.broadcast_state, out.items
 
     def test_threshold_written_to_broadcast_state(self):
         """A valid update must be written into BroadcastState."""
@@ -120,13 +129,13 @@ class TestThresholdBroadcastFunction(unittest.TestCase):
         """
         func = ThresholdBroadcastFunction()
         ctx  = MockBroadcastContext()
-        collected = []
+        out  = MockCollector()
 
         old_update = make_threshold_update(warning=2_000_000_000.0, critical=500_000_000.0)
         new_update = make_threshold_update(warning=1_000_000_000.0, critical=200_000_000.0)
 
-        func.process_broadcast_element(old_update, ctx, collected)
-        func.process_broadcast_element(new_update, ctx, collected)
+        func.process_broadcast_element(old_update, ctx, out)
+        func.process_broadcast_element(new_update, ctx, out)
 
         stored = ctx.broadcast_state.get("GBP:RTGS-GBP-001")
         self.assertAlmostEqual(stored["warning"],  1_000_000_000.0,
@@ -184,12 +193,13 @@ class TestHotReloadChangesAlertBehaviour(unittest.TestCase):
 
     def _run_with_thresholds(self, thresholds, amount):
         func = LiquidityPositionFunction()
-        ctx  = MockRuntimeContext(thresholds=thresholds)
-        func.open(ctx)
+        runtime_ctx = MockRuntimeContext(thresholds=thresholds)
+        func.open(runtime_ctx)
 
-        collected = []
-        mock_ctx  = MockContext()
-        func.process_element(make_payment(amount=amount, direction="CREDIT"), mock_ctx, collected)
+        mock_ctx = MockContext(broadcast_state=runtime_ctx._broadcast)
+        collected = list(func.process_element(
+            make_payment(amount=amount, direction="CREDIT"), mock_ctx
+        ))
         return [r for t, r in collected if t == "alert"]
 
     def test_lowering_warning_threshold_suppresses_warning(self):
