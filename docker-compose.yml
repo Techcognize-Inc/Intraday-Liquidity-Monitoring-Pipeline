@@ -30,11 +30,11 @@ x-airflow-common: &airflow-common
     # Fernet key — used to encrypt Airflow connection passwords at rest (fixed value for dev)
     AIRFLOW__CORE__FERNET_KEY: ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=
     AIRFLOW__WEBSERVER__SECRET_KEY: liquidity-pipeline-secret
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"          # don't clutter UI with Airflow's built-in demo DAGs
-    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"  # re-scan dags/ folder every 30s
-    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"   # gunicorn worker timeout
-    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600"  # 10 min — covers pip install + gunicorn startup
-    AIRFLOW__WEBSERVER__WORKERS: "1"                      # 1 worker — faster startup, enough for dev use
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false" # don't clutter UI with Airflow's built-in demo DAGs
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30" # re-scan dags/ folder every 30s
+    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300" # gunicorn worker timeout
+    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600" # 10 min — covers pip install + gunicorn startup
+    AIRFLOW__WEBSERVER__WORKERS: "1" # 1 worker — faster startup, enough for dev use
     # PostgreSQL connection for the DAG's business logic (pending_payments table)
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
@@ -44,9 +44,9 @@ x-airflow-common: &airflow-common
     # Install required packages at startup — psycopg2 for PostgreSQL, faker for synthetic data
     _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary faker"
   volumes:
-    - ./dags:/opt/airflow/dags:ro          # DAG files (read-only — Airflow reads, doesn't write)
+    - ./dags:/opt/airflow/dags:ro # DAG files (read-only — Airflow reads, doesn't write)
     - ./producers:/opt/airflow/producers:ro # producers module (pending_payments_generator.py)
-    - airflow-logs:/opt/airflow/logs        # task logs (persisted so you can view them in UI)
+    - airflow-logs:/opt/airflow/logs # task logs (persisted so you can view them in UI)
   depends_on:
     postgres:
       condition: service_healthy
