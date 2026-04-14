@@ -18,6 +18,38 @@
 #    grafana         — Displays the live dashboard
 # ─────────────────────────────────────────────────────────────────
 
+# ── Shared Airflow configuration (YAML anchor) ───────────────────
+# x-airflow-common defines env vars, volumes, and network shared by
+# airflow-init, airflow-webserver, and airflow-scheduler.
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.0
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # LocalExecutor runs tasks as subprocesses — needs a real DB (not SQLite)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    # Fernet key — used to encrypt Airflow connection passwords at rest (fixed value for dev)
+    AIRFLOW__CORE__FERNET_KEY: ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=
+    AIRFLOW__WEBSERVER__SECRET_KEY: liquidity-pipeline-secret
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"          # don't clutter UI with Airflow's built-in demo DAGs
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"  # re-scan dags/ folder every 30s
+    # PostgreSQL connection for the DAG's business logic (pending_payments table)
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: liquidity
+    POSTGRES_USER: liquidity_user
+    POSTGRES_PASSWORD: liquidity_pass
+    # Install required packages at startup — psycopg2 for PostgreSQL, faker for synthetic data
+    _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary faker"
+  volumes:
+    - ./dags:/opt/airflow/dags:ro          # DAG files (read-only — Airflow reads, doesn't write)
+    - ./producers:/opt/airflow/producers:ro # producers module (pending_payments_generator.py)
+    - airflow-logs:/opt/airflow/logs        # task logs (persisted so you can view them in UI)
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - liquidity-net
+
 # ── Shared Flink configuration (YAML anchor) ─────────────────────
 # x-flink-common is a YAML anchor — it defines shared config that
 # both flink-jobmanager and flink-taskmanager inherit with <<: *flink-common
@@ -216,6 +248,8 @@ services:
       # 01_schema.sql runs first — creates all 6 tables
       - ./postgresql/seed_thresholds.sql:/docker-entrypoint-initdb.d/02_seed_thresholds.sql:ro
       # 02_seed_thresholds.sql runs second — inserts initial threshold values
+      - ./postgresql/init_airflow_db.sql:/docker-entrypoint-initdb.d/03_airflow_db.sql:ro
+      # 03_airflow_db.sql runs third — creates separate 'airflow' metadata DB and user
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U liquidity_user -d liquidity"]
       # pg_isready = built-in PostgreSQL tool that checks if the DB is accepting connections
@@ -342,6 +376,110 @@ services:
     restart: "no"
 
   # ──────────────────────────────────────────────────────────────
+  #  THRESHOLD SEEDER (DEMO)
+  #  Runs seed_demo_thresholds.sh ONCE to publish intentionally low
+  #  thresholds (warning=1000, critical=500) to the liquidity.thresholds
+  #  Kafka topic, then exits.
+  #
+  #  Why this is needed:
+  #    seed_thresholds.sql only seeds PostgreSQL.
+  #    BroadcastState reads from Kafka — without Kafka messages,
+  #    no alerts ever fire. This one-shot service fixes that.
+  #
+  #  For production: remove this service and use threshold_publisher.py
+  #  manually from the treasury desk with realistic values.
+  # ──────────────────────────────────────────────────────────────
+  threshold-init:
+    image: liquidity-producer:latest
+    container_name: threshold-init
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully # topics must exist first
+      postgres:
+        condition: service_healthy # needed for audit trail write
+    entrypoint: ["/bin/bash", "/scripts/seed_demo_thresholds.sh"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: liquidity
+      POSTGRES_USER: liquidity_user
+      POSTGRES_PASSWORD: liquidity_pass
+    volumes:
+      - ./scripts/seed_demo_thresholds.sh:/scripts/seed_demo_thresholds.sh:ro
+      - ./producers:/app/producers:ro # threshold_publisher.py lives here
+    networks:
+      - liquidity-net
+    restart: "no" # one-shot — exits after seeding, never restarts
+
+  # ──────────────────────────────────────────────────────────────
+  #  AIRFLOW INITIALISER
+  #  One-shot service that:
+  #    1. Runs `airflow db init` to create all Airflow metadata tables
+  #       in the 'airflow' PostgreSQL database
+  #    2. Creates the admin user for the Airflow web UI
+  #  Exits with code 0 when done. Other Airflow services wait for it.
+  # ──────────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Liquidity \
+          --lastname Admin \
+          --role Admin \
+          --email admin@liquidity-pipeline.local
+    restart: "no" # one-shot — exits after init
+
+  # ──────────────────────────────────────────────────────────────
+  #  AIRFLOW WEBSERVER
+  #  Serves the Airflow web UI at http://localhost:8080
+  #  Login: admin / admin
+  #  Shows all DAGs, run history, task logs, and XCom values.
+  # ──────────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080" # Airflow UI (host:8080 → container:8080)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully # DB must be initialised first
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s # give webserver time to start before health checks begin
+
+  # ──────────────────────────────────────────────────────────────
+  #  AIRFLOW SCHEDULER
+  #  Monitors DAG files, triggers runs on schedule, submits tasks
+  #  to the LocalExecutor (runs tasks as subprocesses on same host).
+  #  Runs pending_payments_dag every 30 min Mon-Fri 07:00-18:00 UTC.
+  # ──────────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────
   #  PAYMENT PRODUCER
   #  Generates synthetic RTGS/CHAPS/Internal payment events.
   #  Publishes to Kafka topics at configurable TPS rates.
@@ -466,3 +604,4 @@ volumes:
   flink-savepoints: # Flink manual savepoints (for planned restarts/upgrades)
   prometheus-data: # Prometheus time-series metrics database
   grafana-data: # Grafana settings, users, alert rules
+  airflow-logs: # Airflow task logs (viewable in web UI under Browse → Task Instances)
