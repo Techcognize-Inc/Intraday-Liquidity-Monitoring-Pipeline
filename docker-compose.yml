@@ -581,6 +581,29 @@ services:
     networks:
       - liquidity-net
 
+  # ──────────────────────────────────────────────────────────────
+  #  JENKINS
+  #  CI/CD server that runs the Jenkinsfile pipeline.
+  #  Mounts the Docker socket so Jenkins can run docker-compose
+  #  commands against the host Docker daemon.
+  #  Web UI at http://localhost:8090
+  # ──────────────────────────────────────────────────────────────
+  jenkins:
+    image: liquidity-jenkins:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.jenkins
+    container_name: jenkins
+    ports:
+      - "8090:8080"   # Jenkins Web UI (host:8090 → container:8080)
+      - "50000:50000" # Jenkins agent port (for distributed builds)
+    volumes:
+      - jenkins-data:/var/jenkins_home           # persist Jenkins config, jobs, and plugins
+      - /var/run/docker.sock:/var/run/docker.sock # lets Jenkins run docker/docker-compose on the host
+    networks:
+      - liquidity-net
+    restart: unless-stopped
+
 # ──────────────────────────────────────────────────────────────────
 #  NETWORKS
 #  All services are on the same bridge network.
@@ -608,3 +631,4 @@ volumes:
   prometheus-data: # Prometheus time-series metrics database
   grafana-data: # Grafana settings, users, alert rules
   airflow-logs: # Airflow task logs (viewable in web UI under Browse → Task Instances)
+  jenkins-data: # Jenkins home directory — stores jobs, plugins, credentials, build history
