@@ -594,6 +594,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.jenkins
     container_name: jenkins
+    user: root  # needed to access the Docker socket mounted from the host
     ports:
       - "8090:8080"   # Jenkins Web UI (host:8090 → container:8080)
       - "50000:50000" # Jenkins agent port (for distributed builds)
